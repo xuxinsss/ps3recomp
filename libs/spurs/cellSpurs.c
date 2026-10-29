@@ -1187,7 +1187,7 @@ s32 cellSpursInitializeWithAttribute2_ours(CellSpurs* spurs, const CellSpursAttr
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     u32 spurs_ea = (u32)(uintptr_t)spurs;
     const CellSpursAttribute* attr_h = GUEST_PTR(attr, const CellSpursAttribute*);
-    s32 rc = spurs_initialize_common(spurs_ea, attr_h->nSpus, (const char*)attr_h->prefix);
+    s32 rc = spurs_initialize_common(spurs_ea, attr_h->nSpus, (const char*)attr_h->prefix, 0);
     printf("[cellSpurs] InitializeWithAttribute2() ea=0x%08X nSpus=%u rc=%d\n",
            spurs_ea, attr_h->nSpus, rc);
     return rc;
