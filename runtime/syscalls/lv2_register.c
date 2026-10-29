@@ -2480,6 +2480,11 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* Process control */
     lv2_syscall_register(tbl, SYS_PROCESS_GETPID, sys_process_getpid_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_EXIT,   sys_process_exit_handler);
+    /* 22 = _sys_process_exit on real lv2 / RPCS3's binding table (3 is the
+     * number bare-metal/newlib images issue; both spell the same call). An
+     * unregistered 22 used to fall through to the catch-all stub, which told
+     * the guest its exit succeeded -- and the guest carried on executing. */
+    lv2_syscall_register(tbl, 22,                 sys_process_exit_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_GET_SDK_VERSION, sys_process_get_sdk_version_handler);
     lv2_syscall_register(tbl, SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS,
                          sys_process_is_spu_lock_line_reservation_address);

@@ -988,7 +988,7 @@ void spu_ch_wake(spu_context* ctx)
  * two waits is a busy span, tagged with the lifted image and the SPURS workload
  * id the kernel keeps at LS 0x1DC (SpursKernelContext.wklCurrentId) when it
  * goes idle. Waits shorter than PS3_FTRACE_MIN_US do not split a busy span. */
-static __thread uint64_t t_ft_busy0;
+static SPU_TLS uint64_t t_ft_busy0;
 
 static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 {
@@ -1800,7 +1800,12 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * budget is spent by FMOD's WAIT_SIGNAL loop long before a later task). */
     static int s_si = -2;
     if (s_si == -2) { const char* e = getenv("SPU_SYSCALL_IMG"); s_si = e ? atoi(e) : -1; }
-    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24) || ctx->image_id == s_si)
+    /* spurs_test 2026-10-28 DIAG: log uncapped for every image EXCEPT image 1
+     * (the avalanche task, ~1M instances whose syscalls would bury the log).
+     * The Ping-Pong phase uses different images and we don't know their ids
+     * yet -- this makes the log tell us. */
+    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24) || ctx->image_id == s_si ||
+                               (s_si < 0 && ctx->image_id > 1))
         fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d link/r0=0x%05X wobj@2FDC=0x%02X%02X%02X%02X\n",
                 num, raw, ctx->gpr[4]._u32[0], ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
                 ctx->ls[0x2FDC], ctx->ls[0x2FDD], ctx->ls[0x2FDE], ctx->ls[0x2FDF]); }
@@ -1831,6 +1836,13 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * woken). Honour the first call, halt on the rest. Each task runs on its own
      * host thread, so a thread-local count is per task. */
     static _Thread_local int s_exit_seen = 0;
+    /* (spurs_test 2026-10-28: the SPURS_NUM0_RETURN_IMG first-call-returns hack
+     * lived here during diagnosis and is REMOVED -- RPCS3's policy
+     * (spursTasksetProcessSyscall) never returns to the caller on EXIT, it
+     * dispatches the next task. The "CRT expects the syscall to return" reading
+     * was an artifact of the hack's own fake return; halt-on-num0 is the
+     * faithful semantics. The cri image-22 special case below predates this
+     * finding and stays untouched for now.) */
     if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))

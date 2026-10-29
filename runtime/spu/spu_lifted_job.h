@@ -277,11 +277,18 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * passes the (r3.word0>>16)==0x40 gate), so do NOT clobber it. The earlier
      * forced r3.word0=0x40 here was a misread of the gate (see above) and made
      * the cri task halt at func_00003ED0 instead of decoding -- removed. */
-    /* SPURS leaf ABI: the real PM (spursTasksetStartTask) sets r4 = {taskset->args (d0),
-     * taskset->spurs EA (d1)}, read from the SpursTasksetContext at LS 0x2700+0x60/0x68
-     * (planted by spurs_pm_build_context). Without it the leaf reads a garbage SPURS base
-     * and DMAs from a bad address / bails at init. Set for image 22 (cri) when the context
-     * carries a non-zero spurs ptr. */
+    /* SPURS leaf ABI: r4 = {taskset->args (d0), taskset->spurs EA (d1)}, read from
+     * the SpursTasksetContext at LS 0x2700+0x60/0x68 (planted by
+     * spurs_pm_build_context). NOTE ON PROVENANCE (2026-10-29, hard-won):
+     * RPCS3's C++ policy REIMPLEMENTATION (rpcs3_cellSpursSpu.cpp:1395,
+     * spursTasksetStartTask) writes d0=spurs / d1=args -- the OPPOSITE order.
+     * We tried that ("fix r4 swap") and it DEADLOCKED spurs_test Ping-Pong:
+     * the ping task reads its event-flag EA from r4 d0.lo (word1), and with
+     * d0=spurs it found the CellSpurs struct there instead. With args in d0
+     * Ping-Pong passes against RPCS3's actual runtime behaviour (the project's
+     * referee), so the REAL firmware module's convention is args-first, and
+     * RPCS3's reimplementation is not byte-faithful here. Behaviour beats source.
+     * The pong war base also comes from r4 (func_000030C8 gpr81 = r4). */
     if (spurs_task_abi && (image_id == 22 || taskset_ctx)) {
         uint32_t spurs_lo = _LB(0x2764);
         if (spurs_lo) {
