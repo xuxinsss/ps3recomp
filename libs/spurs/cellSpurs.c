@@ -1162,7 +1162,7 @@ enum {
 
 /* _cellSpursTasksetAttribute2Initialize(attr, revision): zero the 512-byte
  * attribute and write the SDK defaults (RPCS3 cellSpurs.cpp:4392). */
-s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision)
+s32 _cellSpursTasksetAttribute2Initialize_ours(u64 attr_ea, u32 revision)
 {
     if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (attr_ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
@@ -1181,7 +1181,7 @@ s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision)
  * our kernel does not branch on. Keep the v1 handler's native-attr
  * convention (the attr was written by our own _cellSpursAttributeInitialize
  * or by lifted BE code -- see the v1 sibling). */
-s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs, const CellSpursAttribute* attr)
+s32 cellSpursInitializeWithAttribute2_ours(CellSpurs* spurs, const CellSpursAttribute* attr)
 {
     if (!spurs || !attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -1197,7 +1197,7 @@ s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs, const CellSpursAttribute
  * (v1 builder writes the identical header; size 0x2900 covers the
  * exit-code array) and register it as a Taskset2 so the SPU runtime keeps
  * its task_exit_code records (RPCS3 cellSpurs.cpp:4484). */
-s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset,
+s32 cellSpursCreateTaskset2_ours(CellSpurs* spurs, CellSpursTaskset* taskset,
                             const void* attr)
 {
     u32 attr_ea = (u32)(uintptr_t)attr;
@@ -1301,7 +1301,7 @@ static s32 spurs_create_task2_impl(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
  * layout is shared with v1, so the slot/bitset/TaskInfo machinery is reused
  * wholesale; dispatch stays inert until the title's lifted SPU images are
  * registered (step 3). */
-s32 cellSpursCreateTask2(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
+s32 cellSpursCreateTask2_ours(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
                          u64 attr_ea, u64 r7)
 {
     static int s_traced = 0;
