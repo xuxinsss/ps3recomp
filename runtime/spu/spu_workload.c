@@ -17,6 +17,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <semaphore.h>
 #include <errno.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
@@ -46,8 +47,15 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
 
 /* ---- registry ---------------------------------------------------------- */
 
+/* LOCAL PATCH (spurs_test 2026-10-28): default 256 -> 4096. The SPU Test
+ * benchmark patches a task counter into each of its 1024 per-task image
+ * copies, so the title registers 1024 fingerprints for ONE lifted image plus
+ * the normal set. 256 silently dropped the rest (registry reports "full").
+ * Setting the define from the port's CMakeLists does not work: source-file
+ * properties are directory-scoped and the runtime target lives in the SDK
+ * subdirectory, so the default here is the only reliable knob. */
 #ifndef SPU_WORKLOAD_MAX
-#define SPU_WORKLOAD_MAX 256
+#define SPU_WORKLOAD_MAX 4096
 #endif
 
 typedef struct {
@@ -381,7 +389,7 @@ static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t siz
  * the SPU is waiting for because it is stuck inside the dispatch. Real SPUs run
  * concurrently with the PPU; a detached host thread models that. The image bytes
  * and args live in the shared guest arena (vm_base), so they stay valid. */
-typedef struct {
+typedef struct spu_async_job {
     const uint8_t*      image;
     uint32_t            image_size;
     uint32_t            args_ea;
@@ -391,7 +399,139 @@ typedef struct {
     int                 have_r3;
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
+    struct spu_async_job* next;       /* pool queue link */
 } spu_async_job;
+
+/* ---- SPU task thread pool (spurs_test 2026-10-28) -------------------------
+ * The legacy path spawns one 256MB-reserve host thread PER TASK
+ * (~2 ms each; the spurs_test avalanche's 2^20 tasks took 40 min wall).
+ * A fixed pool of persistent workers takes jobs from a queue instead.
+ * Semantics are unchanged: a job still runs on its own host thread,
+ * concurrently with the PPU. SPU_PER_TASK_THREADS=1 restores the legacy
+ * per-task spawn (A/B against the pool); SPU_POOL_THREADS=<n> sizes the
+ * pool (default 8). Upstream (2026-10-28): no pool PR -- #291/#630 schedule
+ * POLICY modules, they do not replace per-task host threads. */
+static struct {
+    int           started;
+    unsigned      n_workers;
+    spu_async_job* head;
+    spu_async_job* tail;
+#ifdef _WIN32
+    CRITICAL_SECTION cs;
+    HANDLE        sem;
+#else
+    pthread_mutex_t cs;
+    sem_t         sem;
+#endif
+} s_spu_pool;
+
+static void spu_pool_submit(spu_async_job* j);
+
+static void spu_async_run(spu_async_job* j);   /* defined below; pool workers call it */
+
+static void spu_pool_worker_stack_cleanup(void)
+{
+    extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+    extern void spu_mfc_forget_range(uintptr_t, uintptr_t);
+#ifdef _WIN32
+    ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
+    spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+    spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi);
+#else
+    /* pthread has no portable "current thread stack limits"; the reserver
+     * sets key off address ranges, and on this path jobs run short enough
+     * that skipping the per-job sweep is fine (the legacy thread-per-task
+     * path still cleans up at thread death). */
+    (void)spu_coh_forget_range; (void)spu_mfc_forget_range;
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI spu_pool_worker(LPVOID arg)
+{
+    (void)arg;
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    for (;;) {
+        WaitForSingleObject(s_spu_pool.sem, INFINITE);
+        EnterCriticalSection(&s_spu_pool.cs);
+        spu_async_job* j = s_spu_pool.head;
+        if (j) { s_spu_pool.head = j->next; if (!s_spu_pool.head) s_spu_pool.tail = NULL; j->next = NULL; }
+        LeaveCriticalSection(&s_spu_pool.cs);
+        if (!j) continue;
+        spu_async_run(j);
+        /* The old per-task thread ran this cleanup at thread death; a pooled
+         * worker runs many jobs, so clean per job to keep the reserver sets
+         * from pinning worker-stack ranges forever. */
+        spu_pool_worker_stack_cleanup();
+    }
+    return 0;
+}
+#else
+static void* spu_pool_worker(void* arg)
+{
+    (void)arg;
+    for (;;) {
+        while (sem_wait(&s_spu_pool.sem) != 0) { }
+        pthread_mutex_lock(&s_spu_pool.cs);
+        spu_async_job* j = s_spu_pool.head;
+        if (j) { s_spu_pool.head = j->next; if (!s_spu_pool.head) s_spu_pool.tail = NULL; j->next = NULL; }
+        pthread_mutex_unlock(&s_spu_pool.cs);
+        if (!j) continue;
+        spu_async_run(j);
+        spu_pool_worker_stack_cleanup();
+    }
+    return NULL;
+}
+#endif
+
+static void spu_pool_ensure_started(void)
+{
+    if (s_spu_pool.started) return;
+    s_spu_pool.started = 1;
+    unsigned n = 8;
+    { const char* e = getenv("SPU_POOL_THREADS");
+      if (e && atoi(e) > 0) n = (unsigned)atoi(e); }
+    s_spu_pool.head = s_spu_pool.tail = NULL;
+    s_spu_pool.n_workers = n;
+#ifdef _WIN32
+    InitializeCriticalSection(&s_spu_pool.cs);
+    s_spu_pool.sem = CreateSemaphore(NULL, 0, 0x100000, NULL);
+    for (unsigned i = 0; i < n; i++)
+        CloseHandle(CreateThread(NULL, 256u << 20, spu_pool_worker, NULL,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, NULL));
+#else
+    pthread_mutex_init(&s_spu_pool.cs, NULL);
+    sem_init(&s_spu_pool.sem, 0, 0);
+    for (unsigned i = 0; i < n; i++) {
+        pthread_attr_t attr; pthread_t th;
+        pthread_attr_init(&attr);
+        if (pthread_attr_setstacksize(&attr, 256u << 20) != 0)
+            pthread_attr_destroy(&attr), pthread_attr_init(&attr);
+        if (pthread_create(&th, &attr, spu_pool_worker, NULL) == 0)
+            pthread_detach(th);
+        pthread_attr_destroy(&attr);
+    }
+#endif
+}
+
+static void spu_pool_submit(spu_async_job* j)
+{
+    spu_pool_ensure_started();
+    j->next = NULL;
+#ifdef _WIN32
+    EnterCriticalSection(&s_spu_pool.cs);
+    if (s_spu_pool.tail) s_spu_pool.tail->next = j; else s_spu_pool.head = j;
+    s_spu_pool.tail = j;
+    LeaveCriticalSection(&s_spu_pool.cs);
+    ReleaseSemaphore(s_spu_pool.sem, 1, NULL);
+#else
+    pthread_mutex_lock(&s_spu_pool.cs);
+    if (s_spu_pool.tail) s_spu_pool.tail->next = j; else s_spu_pool.head = j;
+    s_spu_pool.tail = j;
+    pthread_mutex_unlock(&s_spu_pool.cs);
+    sem_post(&s_spu_pool.sem);
+#endif
+}
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
  * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
@@ -1612,6 +1752,12 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                 }
                 fprintf(stderr, "\n");
             } } }
+
+    /* Default: hand the job to the persistent pool (see s_spu_pool above).
+     * SPU_PER_TASK_THREADS=1 restores the legacy per-task spawn for A/B. */
+    { static int s_legacy = -1;
+      if (s_legacy < 0) s_legacy = getenv("SPU_PER_TASK_THREADS") ? 1 : 0;
+      if (!s_legacy) { spu_pool_submit(j); return 1; } }
 
 #ifdef _WIN32
     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
