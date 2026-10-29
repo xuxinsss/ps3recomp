@@ -23,6 +23,17 @@
 #endif
 #include "ps3emu/thread_name.h"
 
+/* Direction-1 (spurs_test perf, 2026-10-29): per-task hot-path prints
+ * (dispatch HIT / start task / built context / RETURNED / signal task) fire
+ * per SPU task dispatch and the stderr cost lands inside the measured loop.
+ * Default OFF; SPURS_HOT_LOG=1 restores them for debugging. */
+static int spu_hot_log(void)
+{
+    static int s_hot = -1;
+    if (s_hot < 0) s_hot = getenv("SPURS_HOT_LOG") ? 1 : 0;
+    return s_hot;
+}
+
 static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                      uint32_t owner_ea);   /* below */
 
@@ -343,9 +354,10 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
         return 0;
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
-        (unsigned long long)fp, entry, args_ea, image_id);
+    if (spu_hot_log())
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
+            (unsigned long long)fp, entry, args_ea, image_id);
 
     spu_run_lifted_job_img(fn, ls, args_ea, image_id);
 
@@ -764,8 +776,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     spu_coh_notify_write(taskset_ea);
     spu_lockline_unlock();
     for (int i = 0; i < n_start; i++) {
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+        if (spu_hot_log())
+            fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                            "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
         spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
     }
@@ -979,9 +992,11 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
-                            "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                    if (spu_hot_log()) {
+                        fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                                "taskset=0x%08X task=%u\n", j->image_id,
+                                j->taskset_ea, j->taskid); fflush(stderr);
+                    }
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -1119,8 +1134,9 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            if (spu_hot_log())
+                fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                        "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
         }
@@ -1724,9 +1740,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
-        (unsigned long long)fp, args_ea, image_id);
+    if (spu_hot_log())
+        fprintf(stderr,
+            "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+            (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
             /* Dump a larger window of the task context buffer + scan for any word

@@ -35,6 +35,18 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
  * pointer is enough here. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
+/* Direction-1 (spurs_test perf, 2026-10-29): per-task hot-path prints
+ * (CreateTask/JoinTask2/CreateTask2/SendSignal) fire millions of times in a
+ * benchmark pass and the fprintf/stdout cost lands inside the measured loop.
+ * Default OFF; SPURS_HOT_LOG=1 restores them for debugging. One-time prints
+ * (Initialize/CreateTaskset/...) stay unconditional. */
+static int spurs_hot_log(void)
+{
+    static int s_hot = -1;
+    if (s_hot < 0) s_hot = getenv("SPURS_HOT_LOG") ? 1 : 0;
+    return s_hot;
+}
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -1191,11 +1203,12 @@ static s32 spurs_create_task2_impl(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
                            task_arg, task_lsp);
     g_ydkj_real_taskset_ea = (u32)taskset_ea;  /* dispatch handoff (v1 pattern) */
     g_ydkj_real_taskid     = slot;
-    printf("[cellSpurs] CreateTask2(id=%u taskset=0x%08X elf=0x%llX ctx=0x%llX"
-           " arg=%08X %08X %08X %08X)\n",
-           slot, (u32)taskset_ea, (unsigned long long)eaElf,
-           (unsigned long long)context_ea,
-           task_arg[0], task_arg[1], task_arg[2], task_arg[3]);
+    if (spurs_hot_log())
+        printf("[cellSpurs] CreateTask2(id=%u taskset=0x%08X elf=0x%llX ctx=0x%llX"
+               " arg=%08X %08X %08X %08X)\n",
+               slot, (u32)taskset_ea, (unsigned long long)eaElf,
+               (unsigned long long)context_ea,
+               task_arg[0], task_arg[1], task_arg[2], task_arg[3]);
 
     if (eaElf) {
         const uint8_t* host_elf = GUEST_PTR((void*)(uintptr_t)eaElf, const uint8_t*);
@@ -1299,8 +1312,9 @@ s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
             { extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
               spu_lockline_lock(); e[15] = TS2_ST_JOINED; spu_lockline_unlock(); }
             if (exitCode_ea) vm_write32((u32)exitCode_ea, code);
-            printf("[cellSpurs] JoinTask2(id=%u taskset=0x%08X exit=0x%08X)\n",
-                   taskId, (u32)taskset_ea, code);
+            if (spurs_hot_log())
+                printf("[cellSpurs] JoinTask2(id=%u taskset=0x%08X exit=0x%08X)\n",
+                       taskId, (u32)taskset_ea, code);
             return CELL_OK;
         }
         if (state == TS2_ST_JOINED) {
@@ -1315,8 +1329,9 @@ s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
             u32 code = ((u32)e[8] << 24) | ((u32)e[9] << 16)
                      | ((u32)e[10] << 8) | e[11];
             if (exitCode_ea) vm_write32((u32)exitCode_ea, code);
-            printf("[cellSpurs] JoinTask2(id=%u taskset=0x%08X exit=0x%08X) (rejoin)\n",
-                   taskId, (u32)taskset_ea, code);
+            if (spurs_hot_log())
+                printf("[cellSpurs] JoinTask2(id=%u taskset=0x%08X exit=0x%08X) (rejoin)\n",
+                       taskId, (u32)taskset_ea, code);
             return CELL_OK;
         }
         /* still running: poll (the SPU task exit path writes the record from
@@ -1440,10 +1455,11 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
-                   " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
-                   s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
-                   context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
+            if (spurs_hot_log())
+                printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                       " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
+                       s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+                       context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
 
             /* One-shot: dump the memory the task argument points at, to find the
              * pointer that reads back 0 (the task GETs from EA 0 -> some field of
@@ -1712,7 +1728,7 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
     (void)taskset;
     s32* exitCode_h = GUEST_PTR(exitCode, s32*);
 
-    printf("[cellSpurs] JoinTask(id=%u)\n", taskId);
+    if (spurs_hot_log()) printf("[cellSpurs] JoinTask(id=%u)\n", taskId);
 
     /* Find the task and mark as completed */
     for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
@@ -1735,7 +1751,7 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)
      * waiter (spu_taskset_wait_signal) keys on the guest EA + taskId. */
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
 
-    printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    if (spurs_hot_log()) printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
 
     /* Deliver the signal for real: set the task's bit in the guest taskset's
      * SIGNALLED bitset and wake its blocked host thread. (Was a documented
