@@ -1346,7 +1346,7 @@ s32 cellSpursCreateTask2_ours(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
  * CellSpursTaskBinInfo: eaElf u64@0x00, sizeContext u32@0x08, lsPattern u64@0x10.
  * r6 = the 16-byte CellSpursTaskArgument (each ping-pong task's event-flag
  * bit rides in word 0), r7 = the per-task context save buffer (sizeContext). */
-s32 cellSpursCreateTask2WithBinInfo(u64 taskset_ea, u64 taskId_ea, u64 binInfo_ea,
+s32 cellSpursCreateTask2WithBinInfo_ours(u64 taskset_ea, u64 taskId_ea, u64 binInfo_ea,
                                     u64 argument_ea, u64 eaContext)
 {
     static int s_traced = 0;
@@ -1387,7 +1387,7 @@ s32 cellSpursCreateTask2WithBinInfo(u64 taskset_ea, u64 taskId_ea, u64 binInfo_e
  * task_exit_code record (state 2), mark it joined (4), hand the BE exit
  * code to the caller. Blocks like the real firmware; unblocks when the
  * SPU task exit path (spu_taskset2_set_exit) publishes the record. */
-s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
+s32 cellSpursJoinTask2_ours(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
 {
     if (!taskset_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (taskId >= CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
@@ -1456,7 +1456,7 @@ s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
 /* cellSpursDestroyTaskset2(taskset): teardown after all tasks joined.
  * Guest-visible effect is only the return code (same simplification as the
  * v1 DestroyTaskset, which shipped with real titles). */
-s32 cellSpursDestroyTaskset2(u64 taskset_ea)
+s32 cellSpursDestroyTaskset2_ours(u64 taskset_ea)
 {
     if (!taskset_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     printf("[cellSpurs] DestroyTaskset2(ea=0x%08X)\n", (u32)taskset_ea);
