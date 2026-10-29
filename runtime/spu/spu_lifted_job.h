@@ -18,6 +18,7 @@
 #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 
 void spu_mfc_release(spu_context* ctx);   /* spu_channels.c */
@@ -164,7 +165,23 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
 {
     if (!entry) return -1;
     spu_context ctx;
-    spu_context_init(&ctx, 0);
+    if (local_store) {
+        /* Direction-2 (spurs_test perf): run DIRECTLY in the caller's buffer.
+         * The old code memcpy'd 256KB in and out around every task (~50us of
+         * the ~112us run phase); ctx.ls is a pointer precisely so a context
+         * can be repointed (raw SPU does it at guest memory). ls_store is
+         * unreferenced while an external LS is installed (its only other
+         * touch is spu_context_init), so zero the context around it instead
+         * of memsetting 256KB+ per task. */
+        memset(&ctx, 0, offsetof(spu_context, ls_store));
+        memset((char*)&ctx + offsetof(spu_context, ls),
+               0, sizeof(spu_context) - offsetof(spu_context, ls));
+        ctx.ls     = local_store;
+        ctx.spu_id = 0;
+        ctx.status = SPU_STATUS_STOPPED;
+    } else {
+        spu_context_init(&ctx, 0);
+    }
     { static int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
@@ -193,7 +210,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * this it is 0 from spu_context_init, so the first `r1 -= frame` wraps
      * negative -> garbage stack -> null function pointers -> branch to LS 0. */
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
-    if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
+    /* local_store case: ctx.ls already points at the caller's buffer
+     * (direction-2 repoint above) -- no copy-in. */
     /* A SpursTasksetContext at LS 0x2700 (built by spurs_pm_build_context) writes
      * syscallAddr=0xA70 at STC_SYSCALL_ADDR (0x27C4). That sentinel means "this is
      * a generic SPURS taskset task" (LBP's audio SPEEX/MultiStream tasks) -- flOw
@@ -339,7 +357,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);
     spu_mfc_release(&ctx);   /* or its MFC slot leaks and later SPUs share one engine */
-    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+    /* No copy-out: with an external LS the task already ran in (and wrote
+     * back into) the caller's buffer itself (direction-2). */
     return 0;
 }
 

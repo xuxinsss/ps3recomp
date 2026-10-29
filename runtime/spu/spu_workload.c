@@ -34,6 +34,54 @@ static int spu_hot_log(void)
     return s_hot;
 }
 
+/* ---- phase profiler (SPURS_PROF=1, spurs_test direction-2) ---------------
+ * Per-task wall-time split of the dispatch path, in microseconds. The
+ * accumulator with the biggest average is direction-2's first target.
+ * Dumps to stderr every 65536 samples per phase (taskkill-safe: the last
+ * dump before the kill holds near-final averages). */
+#ifdef _WIN32
+static unsigned long long spurs_prof_now(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (unsigned long long)(c.QuadPart * 1000000ULL / (unsigned long long)f.QuadPart);
+}
+#else
+static unsigned long long spurs_prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+}
+#endif
+typedef struct { unsigned long long total, n; } spurs_prof_acc;
+static spurs_prof_acc s_prof_lookup, s_prof_submit, s_prof_ls, s_prof_load,
+                      s_prof_ctx, s_prof_run, s_prof_exit;
+static int spurs_prof_on(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("SPURS_PROF") ? 1 : 0;
+    return s_on;
+}
+static void spurs_prof_dump(void)
+{
+    fprintf(stderr,
+        "[spurs-prof] lookup=%llu/%llu=%lluus submit=%llu/%llu=%lluus ls=%llu/%llu=%lluus"
+        " load=%llu/%llu=%lluus ctx=%llu/%llu=%lluus run=%llu/%llu=%lluus exit=%llu/%llu=%lluus\n",
+        s_prof_lookup.total, s_prof_lookup.n, s_prof_lookup.n ? s_prof_lookup.total / s_prof_lookup.n : 0,
+        s_prof_submit.total, s_prof_submit.n, s_prof_submit.n ? s_prof_submit.total / s_prof_submit.n : 0,
+        s_prof_ls.total, s_prof_ls.n, s_prof_ls.n ? s_prof_ls.total / s_prof_ls.n : 0,
+        s_prof_load.total, s_prof_load.n, s_prof_load.n ? s_prof_load.total / s_prof_load.n : 0,
+        s_prof_ctx.total, s_prof_ctx.n, s_prof_ctx.n ? s_prof_ctx.total / s_prof_ctx.n : 0,
+        s_prof_run.total, s_prof_run.n, s_prof_run.n ? s_prof_run.total / s_prof_run.n : 0,
+        s_prof_exit.total, s_prof_exit.n, s_prof_exit.n ? s_prof_exit.total / s_prof_exit.n : 0);
+}
+#define PROF(acc, t0) do { if (spurs_prof_on()) { \
+    unsigned long long _dt = spurs_prof_now() - (t0); \
+    (acc).total += _dt; (acc).n++; \
+    if ((acc).n % 65536 == 0) spurs_prof_dump(); } } while (0)
+
 static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                      uint32_t owner_ea);   /* below */
 
@@ -795,6 +843,7 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
 
 static void spu_async_run(spu_async_job* j)
 {
+    unsigned long long _pt0 = spurs_prof_now(), _pt5 = 0;
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -816,8 +865,23 @@ static void spu_async_run(spu_async_job* j)
                     j->taskset_ea, j->taskid, j->image_id,
                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
     } else {
+#ifdef _WIN32
+        /* Direction-2 (spurs_test perf): the per-dispatch calloc(256KB) went
+         * through the CRT heap with 8 pool workers fighting one lock -- the
+         * profile showed ~27us/task just in this phase. Reuse this worker
+         * thread's own buffer instead; re-zero to preserve the calloc
+         * semantics (spu_elf_load_to_ls only writes PT_LOAD segments, so the
+         * rest of LS must read as zero). */
+        static __declspec(thread) uint8_t* s_tls_ls = NULL;
+        if (!s_tls_ls) s_tls_ls = (uint8_t*)malloc(SPU_LS_SIZE);
+        ls = s_tls_ls;
+        if (ls) memset(ls, 0, SPU_LS_SIZE);
+#else
         ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+#endif
     }
+    PROF(s_prof_ls, _pt0);
+    unsigned long long _pt2 = spurs_prof_now();
     if (ls) {
         uint32_t entry = 0;
         /* Load the image only on a taskset's FIRST task (or every dispatch when
@@ -829,6 +893,8 @@ static void spu_async_run(spu_async_job* j)
         if (!loaded)
             fprintf(stderr, "[spu_workload] async image=%d ELF LOAD FAILED\n",
                     j->image_id), fflush(stderr);
+        PROF(s_prof_load, _pt2);
+        unsigned long long _pt3 = spurs_prof_now();
         if (loaded) {
             /* YDKJ_CRI_POLICY (cri build experiment): the cri SPU task
              * (image 22) calls the SPURS task-API via a jump table at LS 0x2700
@@ -870,7 +936,13 @@ static void spu_async_run(spu_async_job* j)
                                                      j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, 0);
                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
                 fflush(stderr);
-                free(ls); free(j); return;
+                /* ls is the worker's TLS pool buffer on Windows (direction-2) --
+                 * do NOT free it here or the next dispatch on this thread
+                 * touches freed memory. */
+#ifndef _WIN32
+                free(ls);
+#endif
+                free(j); return;
             }
             /* YDKJ HLE cri-task path (image 22, cri_mpvps3spurs.elf): the real
              * SPURS kernel/policy would build the task's SpursTasksetContext (LS
@@ -999,6 +1071,8 @@ static void spu_async_run(spu_async_job* j)
                     }
                 }
             }
+            PROF(s_prof_ctx, _pt3);
+            unsigned long long _pt4 = spurs_prof_now();
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
              * (1) dump binkspu's Bink work-descriptor at its arg EA so we can see
              *     the output-plane EAs and the plane+0x50 "needs-decode" gate that
@@ -1137,12 +1211,19 @@ static void spu_async_run(spu_async_job* j)
             if (spu_hot_log())
                 fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                         "(job ran to completion, did not loop)\n", j->image_id, rc);
+            PROF(s_prof_run, _pt4);
+            _pt5 = spurs_prof_now();
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
         }
         /* Persistent LS is retained in its taskset slot for the next task; a
-         * per-dispatch LS is freed. */
-        if (!ts_slot) free(ls);
+         * per-dispatch LS is freed (Windows: it is the worker's TLS buffer,
+         * kept for reuse -- direction-2). */
+        if (!ts_slot) {
+#ifndef _WIN32
+            free(ls);
+#endif
+        }
     }
     if (ts_slot) {
 #ifdef _WIN32
@@ -1151,6 +1232,7 @@ static void spu_async_run(spu_async_job* j)
         pthread_mutex_unlock(&ts_slot->lock);
 #endif
     }
+    PROF(s_prof_exit, _pt5);
     free(j);
 }
 
@@ -1679,11 +1761,14 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
+    unsigned long long _pt0 = spurs_prof_now();
     uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    PROF(s_prof_lookup, _pt0);
+    unsigned long long _pt1 = spurs_prof_now();
     if (!fn) {
         /* SPU_DUMP_MISS also applies here. The sync path has written the
          * unrecognised image out for a while and the async path did not, so a
@@ -1774,7 +1859,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * SPU_PER_TASK_THREADS=1 restores the legacy per-task spawn for A/B. */
     { static int s_legacy = -1;
       if (s_legacy < 0) s_legacy = getenv("SPU_PER_TASK_THREADS") ? 1 : 0;
-      if (!s_legacy) { spu_pool_submit(j); return 1; } }
+      if (!s_legacy) { PROF(s_prof_submit, _pt1); spu_pool_submit(j); return 1; } }
 
 #ifdef _WIN32
     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
