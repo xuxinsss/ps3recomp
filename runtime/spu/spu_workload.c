@@ -77,10 +77,16 @@ static void spurs_prof_dump(void)
         s_prof_run.total, s_prof_run.n, s_prof_run.n ? s_prof_run.total / s_prof_run.n : 0,
         s_prof_exit.total, s_prof_exit.n, s_prof_exit.n ? s_prof_exit.total / s_prof_exit.n : 0);
 }
+/* Atomic accumulators: 8 pool workers race here on every dispatch. The old
+ * non-atomic += lost updates AND occasionally corrupted a counter (a final
+ * dump once showed run=2244us against an 8us penultimate dump -- garbage
+ * that still gets quoted if you only read the last line). fetch/add keeps
+ * every update; the dump may read a slightly stale value, never a torn one. */
 #define PROF(acc, t0) do { if (spurs_prof_on()) { \
     unsigned long long _dt = spurs_prof_now() - (t0); \
-    (acc).total += _dt; (acc).n++; \
-    if ((acc).n % 65536 == 0) spurs_prof_dump(); } } while (0)
+    __atomic_fetch_add(&(acc).total, _dt, __ATOMIC_RELAXED); \
+    unsigned long long _n = __atomic_add_fetch(&(acc).n, 1, __ATOMIC_RELAXED); \
+    if (_n % 65536 == 0) spurs_prof_dump(); } } while (0)
 
 static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                      uint32_t owner_ea);   /* below */
