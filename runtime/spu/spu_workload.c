@@ -1053,16 +1053,29 @@ static void spu_async_run(spu_async_job* j)
              * Build the context here from the real taskset CreateTask recorded;
              * spu_run_lifted_job_abi then sets r3/r4 off the 0xA70 sentinel.
              * Env-gated while bringing this up — default leaves every path as-is. */
+            /* Direction-5 (ctx special): two getenv() calls sat inside the
+             * per-task ctx window. getenv takes the CRT environment lock and
+             * re-scans the block on EVERY call (upstream PR #515 documents the
+             * same cost on the dispatch hot path), so 8 workers serialized on
+             * it once per task. Cache both lookups once per process, exactly
+             * like spu_hot_log()/spurs_prof_on() above; env is constant per run. */
+            static const char* s_lbp_task_delay;
+            static int s_lbp_no_taskset;
+            static int s_lbp_env_done;
+            if (!s_lbp_env_done) {
+                s_lbp_task_delay = getenv("LBP_TASK_DELAY");
+                s_lbp_no_taskset = getenv("LBP_NO_TASKSET") ? 1 : 0;
+                s_lbp_env_done = 1;
+            }
             /* Timing probe: a real SPURS task is dispatched when work is signaled.
              * We dispatch immediately at CreateTask. If LBP fills the task's work
              * buffer slightly LATER, delaying the run lets it see real data (=>
              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
              * a null base, the buffer is never filled (=> an audio HLE gap). */
             if (j->image_id != 22) {
-                const char* d = getenv("LBP_TASK_DELAY");
-                if (d && *d) {
+                if (s_lbp_task_delay && *s_lbp_task_delay) {
 #ifdef _WIN32
-                    Sleep((unsigned)(atoi(d) * 1000));
+                    Sleep((unsigned)(atoi(s_lbp_task_delay) * 1000));
 #endif
                 }
             }
@@ -1076,7 +1089,7 @@ static void spu_async_run(spu_async_job* j)
              * Planting it makes the mixer read the real FMOD control block
              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
+            if (j->image_id != 22 && !s_lbp_no_taskset) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
                  * globals, which the next CreateTask clobbers -- the race that made
