@@ -896,11 +896,22 @@ static void spu_async_run(spu_async_job* j)
          * profile showed ~27us/task just in this phase. Reuse this worker
          * thread's own buffer instead; re-zero to preserve the calloc
          * semantics (spu_elf_load_to_ls only writes PT_LOAD segments, so the
-         * rest of LS must read as zero). */
+         * rest of LS must read as zero).
+         * Direction-5: the eager 256KB memset cost ~5us/task (the ls phase).
+         * On Windows use a VirtualAlloc'd buffer and MEM_RESET per task: the
+         * kernel discards the pages WITHOUT writing them and hands zero pages
+         * on demand, so untouched LS costs nothing and only the pages the
+         * task actually reads fault in as zeros -- observably identical to
+         * memset(0). Fallback keeps the memset if the alloc failed. */
         static __declspec(thread) uint8_t* s_tls_ls = NULL;
-        if (!s_tls_ls) s_tls_ls = (uint8_t*)malloc(SPU_LS_SIZE);
+        if (!s_tls_ls) s_tls_ls = (uint8_t*)VirtualAlloc(NULL, SPU_LS_SIZE,
+                                            MEM_RESERVE | MEM_COMMIT,
+                                            PAGE_READWRITE);
         ls = s_tls_ls;
-        if (ls) memset(ls, 0, SPU_LS_SIZE);
+        if (ls) {
+            if (!VirtualAlloc(ls, SPU_LS_SIZE, MEM_RESET, PAGE_READWRITE))
+                memset(ls, 0, SPU_LS_SIZE);
+        }
 #else
         ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
 #endif
@@ -1239,8 +1250,15 @@ static void spu_async_run(spu_async_job* j)
             /* SPU_LS_DUMP=<prefix>: write this job's whole local store when it
              * ends. A reference dump from real hardware is a full local store,
              * so the only way to ask "what ELSE is different" -- rather than
-             * checking one guessed word at a time -- is to diff all 256 KB. */
-            { const char* pfx = getenv("SPU_LS_DUMP");
+             * checking one guessed word at a time -- is to diff all 256 KB.
+             * The getenv is cached once per process (direction 5): it ran
+             * UNCONDITIONALLY here, one CRT-environment-lock round trip per
+             * task inside the run window. */
+            { static const char* s_ls_dump;
+              static int s_ls_dump_done;
+              if (!s_ls_dump_done) { s_ls_dump = getenv("SPU_LS_DUMP");
+                                     s_ls_dump_done = 1; }
+              const char* pfx = s_ls_dump;
               if (pfx) { char path[512];
                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
                   FILE* f = fopen(path, "wb");
