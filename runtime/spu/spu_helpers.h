@@ -47,6 +47,42 @@ static inline void spu_arch_fence(void) { long spu_fence_tmp = 0; _InterlockedEx
 static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 #endif
 
+/* SIMD fast-path enablement, one spelling per toolchain: clang/gcc define
+ * __AVX2__/__SSE4_1__ from -m flags; MSVC's cl defines __AVX2__ (not
+ * __SSE4_1__) from /arch:AVX2, and some versions spell it _M_AVX2 -- probe
+ * all three. AVX2 implies SSE4.1, so one switch in the build flags turns on
+ * every path below. Without this the MSVC build silently takes the scalar
+ * _ref paths everywhere below. */
+#if defined(__AVX2__) || defined(_M_AVX2)
+#define SPU__HAS_AVX2 1
+#else
+#define SPU__HAS_AVX2 0
+#endif
+#if defined(__SSE4_1__) || SPU__HAS_AVX2
+#define SPU__HAS_SSE41 1
+#else
+#define SPU__HAS_SSE41 0
+#endif
+/* SPU_SCALAR_FLOATVEC (build knob) forces the FLOAT vector paths (the X8
+ * fa/fs/fm/fma family and the XE estimate/interpolate/convert family) back to
+ * their scalar references while leaving the integer XI paths on. Measured on
+ * MSVC /arch:AVX2 (Rocket Lake): the float paths win in throughput code but
+ * LOSE on serial per-lane dependency chains -- the Reciprocal benchmark's
+ * Newton loop (frest/fi/fnms/fma chained on one register) regressed +13%
+ * 5/5 rounds with them on, the integer paths won -33%. The float paths do
+ * ~70 vector-latency cycles per call where the scalar refs need ~20; chains
+ * cannot overlap the four lanes enough to pay that back. */
+
+/* Hot-path inlining, both spellings: __forceinline on cl, where
+ * __attribute__ does not parse. SPU__SLOW is the cold fix-up twin. */
+#if defined(_MSC_VER)
+#define SPU__AI   static __forceinline
+#define SPU__SLOW static __declspec(noinline)
+#else
+#define SPU__AI   static inline __attribute__((always_inline))
+#define SPU__SLOW static __attribute__((noinline, cold))
+#endif
+
 /* SPU byte position -> our _u8 index.
  * Our u128 is HOST-NATIVE little-endian (_u32[i]=SPU word i as a value via
  * spu_ls_read128's big-endian load), so within each 4-byte word the _u8[]
@@ -79,11 +115,11 @@ static inline uint8x16_t spu__iota(void) {
  * a Bink video decoder ran at 6-7 fps. The per-lane variable shifts (shl/rot/rotm/rotma) also
  * need AVX2 (vpsllvd & co.) and keep the scalar form without it. Each stays bit-identical to
  * spu_X_ref (tests/test_spu_int_x86.c). */
-#if !defined(__ARM_NEON) && defined(__SSE4_1__) && \
+#if !defined(__ARM_NEON) && SPU__HAS_SSE41 && \
     !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 #define SPU_X86 1
 #include <immintrin.h>
-#define SPU__XI static inline __attribute__((always_inline))
+#define SPU__XI SPU__AI
 SPU__XI __m128i spu__xl(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
 SPU__XI u128 spu__xs(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
 /* Host lane h holds SPU byte h^3. ir[h] = the SPU source byte for the result's SPU byte h^3
@@ -461,7 +497,7 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
  *   sel & 0xC0 == 0xC0 -> 0xFF
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
-#if defined(__SSE4_1__)
+#if SPU__HAS_SSE41
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
  * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
@@ -501,7 +537,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     u128 out; vst1q_u8(out._u8, r); return out;
 }
 #endif
-#if defined(__SSE4_1__) || defined(__ARM_NEON)
+#if SPU__HAS_SSE41 || defined(__ARM_NEON)
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
 static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
@@ -1032,7 +1068,7 @@ SPU__NV_INLINE u128 spu_fm(u128 a, u128 b) { return spu__nv_rz() ? spu__rz_fm(a,
 SPU__NV_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0); }            /* a*b + c */
 SPU__NV_INLINE u128 spu_fms(u128 a, u128 b, u128 c)  { return SPU__NV_FMA(a, b, c, 0, 0x80000000u); }  /* a*b - c */
 SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__NV_FMA(a, b, c, 0x80000000u, 0); }  /* c - a*b */
-#elif defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS)
+#elif SPU__HAS_AVX2 && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_FLOATVEC)
 /* The NEON fast path above, on x86 with AVX2: the four lanes widened to one f64x4 (exact),
  * the operation, the 29 low significand bits cleared, narrowed (exact). Same lane rules: an
  * ordinary single or a true +-0 takes the vector result, a zero result loses its sign, fa/fs
@@ -1041,8 +1077,8 @@ SPU__NV_INLINE u128 spu_fnms(u128 a, u128 b, u128 c) { return SPU__NV_FMA(a, b, 
  * product of two 24-bit significands is exact in double, so a compiler contracting a multiply
  * and an add into an FMA cannot change any rounding here. */
 #include <immintrin.h>
-#define SPU__X8_INLINE static inline __attribute__((always_inline))
-#define SPU__X8_SLOW   static __attribute__((noinline, cold, unused))
+#define SPU__X8_INLINE SPU__AI
+#define SPU__X8_SLOW   SPU__SLOW
 SPU__X8_INLINE __m128i spu__x8_bexp(__m128i x) { return _mm_srli_epi32(_mm_slli_epi32(x, 1), 24); }
 SPU__X8_INLINE __m128i spu__x8_zero(__m128i x) { return _mm_cmpeq_epi32(_mm_slli_epi32(x, 1), _mm_setzero_si128()); }
 SPU__X8_INLINE __m128i spu__x8_plain0(__m128i x) {          /* biased exponent 1..254, or +-0 */
@@ -1559,13 +1595,13 @@ static inline u128 spu_frest_ref(u128 a) {
     return r;
 }
 
-#if defined(__AVX2__) && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#if SPU__HAS_AVX2 && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_FLOATVEC)
 /* The estimate, interpolate and conversion instructions four lanes at a time. Every lane rule
  * above is integer work on the bit fields, so these are exact by construction: no lane falls
  * back. cuflt/csflt read the integer's top bit and next 23 bits from its (exact) double. test_spu_float_est.c
  * checks each one against the scalar reference. */
 #include <immintrin.h>
-#define SPU__XE_INLINE static inline __attribute__((always_inline))
+#define SPU__XE_INLINE SPU__AI
 SPU__XE_INLINE __m128i spu__xe_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
 SPU__XE_INLINE u128 spu__xe_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
 /* the low 32 bits of each 64-bit lane */
@@ -2142,7 +2178,7 @@ static inline u128 spu_shlh(u128 a, u128 b) { return spu_shlh_ref(a, b); }
 static inline u128 spu_roth(u128 a, u128 b) { return spu_roth_ref(a, b); }
 static inline u128 spu_rothm(u128 a, u128 b) { return spu_rothm_ref(a, b); }
 static inline u128 spu_rothma(u128 a, u128 b) { return spu_rothma_ref(a, b); }
-#if defined(__AVX2__)
+#if SPU__HAS_AVX2
 static inline u128 spu_shl(u128 a, u128 b) {
     return spu__xs(_mm_sllv_epi32(spu__xl(a), _mm_and_si128(spu__xl(b), _mm_set1_epi32(0x3F))));
 }
