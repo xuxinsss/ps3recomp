@@ -1113,6 +1113,59 @@ SPU__X8_INLINE __m128i spu__x8_trunc0(__m256d d, __m128i* ok, __m128i* zm, const
     return _mm_andnot_si128(_mm_and_si128(*zm, _mm_set1_epi32((int)0x80000000u)), _mm_castps_si128(_mm256_cvtpd_ps(t)));
 }
 SPU__X8_INLINE int spu__x8_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
+/* Extended-range lanes (biased exponent 255), native in vector form. spu__x8_wide
+ * maps them to Inf/NaN, so the plain path excludes them and every such lane used to
+ * be redone one by one (the per-lane exact path).  The whole lane resolves here,
+ * exact by the same construction the scalar widen path uses: the bit-assembled
+ * widen is exact for every exponent-0..255 word (exponent 0 reads as +-0, matching
+ * spu__sf_split), products of 24-bit significands are exact in double, Knuth TwoSum
+ * gives the add's exact rounding error for the 24-bit-boundary borrow, and the
+ * pack back follows spu__sf_pack128: flush below 2^-126 to +0 (sign dropped),
+ * saturate above the extended range to sign|0x7FFFFFFF. */
+SPU__X8_INLINE __m256d spu__x8_widen_ext(__m128i x) {
+    const __m256i u = _mm256_cvtepu32_epi64(x);
+    const __m256i sign = _mm256_slli_epi64(_mm256_srli_epi64(u, 31), 63);
+    const __m256i be = _mm256_and_si256(_mm256_srli_epi64(u, 23), _mm256_set1_epi64x(0xFF));
+    const __m256i bexp = _mm256_slli_epi64(_mm256_add_epi64(be, _mm256_set1_epi64x(896)), 52);
+    const __m256i man = _mm256_slli_epi64(_mm256_and_si256(u, _mm256_set1_epi64x(0x7FFFFF)), 29);
+    const __m256i b = _mm256_and_si256(_mm256_or_si256(bexp, man),
+                                       _mm256_cmpgt_epi64(be, _mm256_setzero_si256()));
+    return _mm256_castsi256_pd(_mm256_or_si256(sign, b));
+}
+/* s (finite, from exact widened arithmetic) packed to SPU words; every lane resolved:
+ * normal top-24-bits, flush, or saturate -- no caller fix-up needed. */
+SPU__X8_INLINE __m128i spu__x8_trunc_ext(__m256d s, __m256d err) {
+    const __m256i u = _mm256_castpd_si256(s);
+    const __m256i eu = _mm256_castpd_si256(err);
+    const __m256i biased = _mm256_sub_epi64(
+        _mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF)),
+        _mm256_set1_epi64x(896));
+    const __m256i sign = _mm256_and_si256(_mm256_srli_epi64(u, 32),
+                                          _mm256_set1_epi64x(0x80000000ull));
+    const __m256i field = _mm256_or_si256(
+        _mm256_slli_epi64(biased, 23),
+        _mm256_and_si256(_mm256_srli_epi64(u, 29), _mm256_set1_epi64x(0x7FFFFF)));
+    /* borrow one ulp when the 53-bit rounding landed on a 24-bit boundary and the
+     * true value (s +/- err) lies on the far side: err nonzero, opposite sign */
+    const __m256i bnd = _mm256_cmpeq_epi64(_mm256_and_si256(u, _mm256_set1_epi64x(0x1FFFFFFF)),
+                                           _mm256_setzero_si256());
+    const __m256i opp = _mm256_cmpgt_epi64(
+        _mm256_srli_epi64(_mm256_xor_si256(u, eu), 63), _mm256_setzero_si256());
+    const __m256i nz = _mm256_andnot_si256(
+        _mm256_cmpeq_epi64(_mm256_slli_epi64(eu, 1), _mm256_setzero_si256()),
+        _mm256_set1_epi64x(-1));
+    const __m256i borrow = _mm256_and_si256(
+        _mm256_and_si256(bnd, _mm256_and_si256(opp, nz)), _mm256_set1_epi64x(1));
+    const __m256i sat = _mm256_cmpgt_epi64(biased, _mm256_set1_epi64x(255));
+    const __m256i normal = _mm256_andnot_si256(
+        sat, _mm256_cmpgt_epi64(biased, _mm256_setzero_si256()));
+    __m256i f = _mm256_sub_epi64(field, borrow);          /* borrow only lands in-range */
+    f = _mm256_and_si256(f, normal);                      /* below the range: flush to +0 */
+    f = _mm256_andnot_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(0x800000), f), f);
+    __m256i r = _mm256_or_si256(f, _mm256_and_si256(sign, _mm256_or_si256(normal, sat)));
+    r = _mm256_or_si256(r, _mm256_and_si256(sat, _mm256_set1_epi64x(0x7FFFFFFF)));
+    return spu__x8_narrow(r);
+}
 SPU__X8_INLINE __m128i spu__x8_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
 SPU__X8_INLINE u128 spu__x8_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
 SPU__X8_SLOW u128 spu__x8_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t negb) {
@@ -1137,8 +1190,23 @@ SPU__X8_INLINE u128 spu__x8_fa(u128 a, u128 b, uint32_t negb) {
     const __m128i pre = _mm_and_si128(_mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)),
                                       _mm_or_si128(gap, _mm_or_si128(spu__x8_zero(x), spu__x8_zero(y))));
     __m128i ok, zm;
-    const __m128i r = spu__x8_trunc0(_mm256_add_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
+    __m128i r = spu__x8_trunc0(_mm256_add_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
     ok = _mm_and_si128(ok, pre);
+    const __m128i exta = _mm_or_si128(_mm_cmpeq_epi32(spu__x8_bexp(x), _mm_set1_epi32(255)),
+                                      _mm_cmpeq_epi32(spu__x8_bexp(y), _mm_set1_epi32(255)));
+    if (!_mm_test_all_zeros(exta, exta)) {
+        const __m128i zx = spu__x8_zero(x), zy = spu__x8_zero(y);
+        const __m256d wa = spu__x8_widen_ext(x), wb = spu__x8_widen_ext(y);
+        const __m256d ss = _mm256_add_pd(wa, wb), vv = _mm256_sub_pd(ss, wa);
+        const __m256d ee = _mm256_add_pd(_mm256_sub_pd(wa, _mm256_sub_pd(ss, vv)),
+                                         _mm256_sub_pd(wb, vv));
+        const __m128i nr = spu__x8_trunc_ext(ss, ee);
+        /* x == +-0: the addend (y), +0 when y is zero too; y == +-0: x; else native */
+        const __m128i sel = _mm_blendv_epi8(nr, x, zy);
+        const __m128i zr = _mm_blendv_epi8(sel, _mm_and_si128(y, _mm_andnot_si128(zy, _mm_set1_epi32(-1))), zx);
+        r = _mm_blendv_epi8(r, zr, exta);
+        ok = _mm_or_si128(ok, exta);
+    }
     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fa_fix(spu__x8_st(r), ok, a, b, negb);
 }
 SPU__X8_INLINE u128 spu_fa(u128 a, u128 b) { return spu__x8_fa(a, b, 0); }
@@ -1146,8 +1214,17 @@ SPU__X8_INLINE u128 spu_fs(u128 a, u128 b) { return spu__x8_fa(a, b, 0x80000000u
 SPU__X8_INLINE u128 spu_fm(u128 a, u128 b) {
     const __m128i x = spu__x8_ld(a), y = spu__x8_ld(b);
     __m128i ok, zm;
-    const __m128i r = spu__x8_trunc0(_mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
+    __m128i r = spu__x8_trunc0(_mm256_mul_pd(spu__x8_wide(x), spu__x8_wide(y)), &ok, &zm, NULL);
     ok = _mm_and_si128(ok, _mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)));
+    const __m128i extm = _mm_or_si128(_mm_cmpeq_epi32(spu__x8_bexp(x), _mm_set1_epi32(255)),
+                                      _mm_cmpeq_epi32(spu__x8_bexp(y), _mm_set1_epi32(255)));
+    if (!_mm_test_all_zeros(extm, extm)) {
+        const __m128i zf = _mm_or_si128(spu__x8_zero(x), spu__x8_zero(y));
+        const __m128i nr = spu__x8_trunc_ext(
+            _mm256_mul_pd(spu__x8_widen_ext(x), spu__x8_widen_ext(y)), _mm256_setzero_pd());
+        r = _mm_blendv_epi8(r, _mm_andnot_si128(zf, nr), extm);
+        ok = _mm_or_si128(ok, extm);
+    }
     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fm_fix(spu__x8_st(r), ok, a, b);
 }
 /* (+-a*b) + (+-c): the product is exact in double; TwoSum gives the add's exact rounding error. */
@@ -1158,8 +1235,29 @@ SPU__X8_INLINE u128 spu__x8_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     const __m256d sum = _mm256_add_pd(p, zz), bb = _mm256_sub_pd(sum, p);
     const __m256d err = _mm256_add_pd(_mm256_sub_pd(p, _mm256_sub_pd(sum, bb)), _mm256_sub_pd(zz, bb));
     __m128i ok, zm;
-    const __m128i r = spu__x8_trunc0(sum, &ok, &zm, &err);
+    __m128i r = spu__x8_trunc0(sum, &ok, &zm, &err);
     ok = _mm_and_si128(ok, _mm_and_si128(_mm_and_si128(spu__x8_plain0(x), spu__x8_plain0(y)), spu__x8_plain0(z)));
+    /* extended operands (the fi/refinement idiom's exp-255 estimates): resolve those
+     * lanes natively instead of the per-lane exact redo */
+    const __m128i e255 = _mm_set1_epi32(255);
+    const __m128i ext = _mm_or_si128(_mm_or_si128(
+        _mm_cmpeq_epi32(spu__x8_bexp(x), e255), _mm_cmpeq_epi32(spu__x8_bexp(y), e255)),
+        _mm_cmpeq_epi32(spu__x8_bexp(z), e255));
+    if (!_mm_test_all_zeros(ext, ext)) {
+        /* SPU "zero" is any biased-exponent-0 word (spu__sf_split), not just +-0:
+         * a zero factor gives the addend as it is, +0 when the addend is zero too */
+        const __m128i e0 = _mm_cmpeq_epi32(spu__x8_bexp(x), _mm_setzero_si128());
+        const __m128i zf = _mm_or_si128(e0, _mm_cmpeq_epi32(spu__x8_bexp(y), _mm_setzero_si128()));
+        const __m256d pp = _mm256_mul_pd(spu__x8_widen_ext(x), spu__x8_widen_ext(y));
+        const __m256d wz = spu__x8_widen_ext(z);
+        const __m256d ss = _mm256_add_pd(pp, wz), vv = _mm256_sub_pd(ss, pp);
+        const __m256d ee = _mm256_add_pd(_mm256_sub_pd(pp, _mm256_sub_pd(ss, vv)),
+                                         _mm256_sub_pd(wz, vv));
+        const __m128i nr = spu__x8_trunc_ext(ss, ee);
+        const __m128i zfr = _mm_and_si128(z, _mm_cmpgt_epi32(spu__x8_bexp(z), _mm_setzero_si128()));
+        r = _mm_blendv_epi8(r, _mm_blendv_epi8(nr, zfr, zf), ext);
+        ok = _mm_or_si128(ok, ext);
+    }
     return spu__x8_all4(ok) ? spu__x8_st(r) : spu__x8_fma_fix(spu__x8_st(r), ok, a, b, c, negp, negc);
 }
 SPU__X8_INLINE u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__x8_fma(a, b, c, 0, 0); }            /* a*b + c */
