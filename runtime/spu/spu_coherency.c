@@ -152,9 +152,21 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
 static spu_context** s_coh_ctxs;
 static unsigned s_coh_n, s_coh_cap;
 #define SPU_COH_PREFETCH 4
+/* The plain-MSVC configuration (#588) has no __builtin_prefetch; the bare
+ * spelling left an unresolved external at the link of every runtime consumer
+ * built with cl. _mm_prefetch is the same PREFETCH instruction, so the walk
+ * keeps its cache hint there instead of losing it. */
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#endif
 static inline void spu_coh_prefetch_holder(unsigned i)
 {
-    if (i < s_coh_n) __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
+    if (i >= s_coh_n) return;
+#if defined(_MSC_VER)
+    _mm_prefetch((const char*)&s_coh_ctxs[i]->resv_valid, _MM_HINT_T0);
+#else
+    __builtin_prefetch(&s_coh_ctxs[i]->resv_valid);
+#endif
 }
 static spu_coh_watch* s_coh_watches;
 
