@@ -135,6 +135,7 @@ static EventFlagSync* ef_sync_find(uint32_t ea)
 }
 
 static void spurs_commit_hook(uint32_t line);
+extern void spu_mark_event_flag_line(uint32_t ea);
 static EventFlagSync* ef_sync_alloc(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
@@ -149,6 +150,7 @@ static EventFlagSync* ef_sync_alloc(uint32_t ea)
             pthread_mutex_init(&s_ef_sync[i].mtx, NULL);
             pthread_cond_init(&s_ef_sync[i].cond, NULL);
 #endif
+            spu_mark_event_flag_line(ea);
             s_ef_sync[i].initialized = 1;
             return &s_ef_sync[i];
         }
@@ -262,14 +264,12 @@ extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
  * wait-slot registration is needed — and deliberately NOT written, so the
  * SPU-side lifted Set code takes its "no PPU waiter" path and simply ORs
  * bits that our poll then observes. */
-/* The flag struct is ONE 128-byte line the SPU task library updates with
- * GETLLAR/PUTLLC. A PPU read-modify-write of it must hold the lock-line lock
- * for its whole span, or a PUTLLC landing between the read and the write is
- * silently undone: an SPU wait registered there is lost, nothing ever signals
- * the task, and its PPU partner blocks for good (GH3: FMOD's mixer deadlocked
- * at boot in 1 run of ~4). Raw accesses inside: vm_write16 would take the
- * same (non-recursive) lock. The end notifies reserving SPUs via
- * spu_coh_notify_write_locked, which expects the caller to hold the lock. */
+/* Guest EventFlag transactions use the same line lock as SPU PUTLLC.
+ * The table lock below remains for the legacy, non-EventFlag call sites. */
+extern void spu_linelock_lock(uint32_t);
+extern void spu_linelock_unlock(uint32_t);
+extern void spu_linelock_release(uint32_t);
+extern void spu_coh_notify_write(uint32_t);
 extern void spu_lockline_lock(void);
 extern void spu_lockline_unlock(void);
 extern int  spu_coh_is_reserved(uint32_t);
@@ -292,15 +292,40 @@ static inline void ef_line_end(uint32_t ea)
     spu_lockline_unlock();
 }
 
+static inline void event_flag_commit(uint32_t ea)
+{
+    spu_linelock_release(ea);
+    spu_coh_notify_write(ea);
+}
+
+/* Caller holds the flag's host mutex. Never sleep or write the output
+ * pointer while holding the guest line lock. */
+static int event_flag_try_receive(uint32_t ea, u16 pattern, u32 mode, u16* current)
+{
+    spu_linelock_lock(ea);
+    *current = ef_r16(ea + EF_EVENTS);
+    u16 received = (u16)(*current & pattern);
+    int ready = (mode == CELL_SPURS_EVENT_FLAG_AND) ? received == pattern : received != 0;
+    if (ready && vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
+        ef_w16(ea + EF_EVENTS, (u16)(*current & ~received));
+        event_flag_commit(ea);
+    } else {
+        spu_linelock_unlock(ea);
+    }
+    return ready;
+}
+
 static void spurs_ef_set_locked(uint32_t ea, u16 bits)
 {
-    spu_lockline_lock();
+    spu_linelock_lock(ea);
     u16 events        = ef_r16(ea + EF_EVENTS);
     u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
                               ~ef_r16(ea + EF_SPU_PENDING_RECV));
     u16 waitmode      = ef_r16(ea + EF_SPU_WAIT_MODE);
     u16 eventsToClear = 0;
     u16 pendingRecv   = 0;
+    u32 task_ids[CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS];
+    uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
 
     for (int s = 0; s < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; s++) {
         u16 bit = (u16)(0x8000u >> s);
@@ -311,6 +336,7 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
         if ((mask & ~rel) == 0 || (!mode_and && rel != 0)) {
             eventsToClear |= rel;
             pendingRecv   |= bit;
+            task_ids[s] = vm_read8(ea + EF_WAITING_TASK_ID + s);
             ef_w16(ea + EF_PENDING_RECV_EVT + 2u * s, rel);
         }
     }
@@ -323,12 +349,11 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
             events = (u16)(events & ~eventsToClear);
     }
     ef_w16(ea + EF_EVENTS, events);
-    ef_line_end(ea);   /* before signalling: signal_task takes its own locks */
+    event_flag_commit(ea);   /* before signalling: signal_task takes its own locks */
 
     for (int s = 0; s < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; s++) {
         if (pendingRecv & (0x8000u >> s)) {
-            uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
-            u32 taskId = vm_read8(ea + EF_WAITING_TASK_ID + s);
+            u32 taskId = task_ids[s];
             if (ps3_log_verbose())
                 fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X satisfies SPU task "
                         "slot %d (taskset=0x%08X task=%u)\n", ea, s, taskset_ea, taskId);
@@ -2384,16 +2409,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     __atomic_add_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
     LARGE_INTEGER ef_t0; QueryPerformanceCounter(&ef_t0);
     for (;;) {
-        current = vm_read16(ea + EF_EVENTS);
-
-        if (mode == CELL_SPURS_EVENT_FLAG_AND) {
-            if ((current & pattern) == pattern)
-                break;
-        } else {
-            /* OR mode: any requested bit set */
-            if ((current & pattern) != 0)
-                break;
-        }
+        if (event_flag_try_receive(ea, pattern, mode, &current)) break;
 
         if (!ef_wait_timed(sync, 2)) {
             /* Report the stall once per second, naming what would have to run. */
@@ -2419,22 +2435,11 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     __atomic_sub_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
     ef_wait_stats(ea, ef_t0.QuadPart);
-    /* Hand back the observed bits; consume the received ones on AUTO clear. */
     vm_write16(bits_ea, current);
-    u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
-                                                       : (u16)(current & pattern);
     { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
                 "pattern=0x%04X got=0x%04X (waits=%u)\n",
                 (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
-    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
-        /* Clear from the CURRENT word: bits an SPU set since `current` was
-         * read must survive. */
-        spu_lockline_lock();
-        ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
-        ef_line_end(ea);
-    }
-
     ef_unlock(sync);
 
     return CELL_OK;
@@ -2456,29 +2461,12 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     ef_lock(sync);
 
-    u16 current = vm_read16(ea + EF_EVENTS);
-
-    if (mode == CELL_SPURS_EVENT_FLAG_AND) {
-        if ((current & pattern) != pattern) {
-            ef_unlock(sync);
-            return CELL_SPURS_TASK_ERROR_BUSY;
-        }
-    } else {
-        if ((current & pattern) == 0) {
-            ef_unlock(sync);
-            return CELL_SPURS_TASK_ERROR_BUSY;
-        }
+    u16 current;
+    if (!event_flag_try_receive(ea, pattern, mode, &current)) {
+        ef_unlock(sync);
+        return CELL_SPURS_TASK_ERROR_BUSY;
     }
-
     vm_write16(bits_ea, current);
-    u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
-                                                       : (u16)(current & pattern);
-    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
-        spu_lockline_lock();
-        ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
-        ef_line_end(ea);
-    }
-
     ef_unlock(sync);
     return CELL_OK;
 }
@@ -2494,9 +2482,9 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    spu_lockline_lock();
+    spu_linelock_lock(ea);
     ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~bits));
-    ef_line_end(ea);
+    event_flag_commit(ea);
     ef_unlock(sync);
 
     return CELL_OK;

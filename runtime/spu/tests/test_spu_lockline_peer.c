@@ -27,8 +27,8 @@
  * asserted, the raise then happens under the lock, and only afterwards is the
  * acknowledge let through.
  *
- * Two more, after the PUTLLUC cases, cover the GETLLAR that skips the lock
- * (spu_coh_reserve_fast): that it really is lock-free for a registered holder
+ * Two more, after the PUTLLUC cases, cover the GETLLAR that skips the table lock
+ * (spu_coh_reserve_fast): that it skips the table lock for a registered holder
  * on a marked line and still waits otherwise, and -- raced for real this
  * time, because the point is the memory ordering -- that a write racing it is
  * either in the copy or ends the reservation with SPU_EVENT_LR, never neither.
@@ -271,7 +271,7 @@ static void test_putlluc_breaks_peer(void)
 }
 
 /* ===========================================================================
- * GETLLAR without the lock-line lock
+ * GETLLAR reservation-table and data-line locks
  *
  * Which path a GETLLAR took is not visible in its result, so the first test
  * pins it the way the acknowledge test does: hold the lock and see whether a
@@ -289,16 +289,18 @@ static void* llar_thread(void* arg)
     return NULL;
 }
 
-/* 1 if a GETLLAR of ea by g_a completed while this thread held the lock. */
-static int llar_completes_under_held_lock(uint32_t ea)
+/* 1 if GETLLAR completed while this thread held the selected lock. */
+static int llar_completes_under_held_lock(uint32_t ea, int hold_data_line)
 {
     atomic_store(&g_llar_ea_sel, (int)ea);
     atomic_store(&g_llar_entered, 0);
     atomic_store(&g_llar_done, 0);
-    spu_lockline_lock();
+    if (hold_data_line) spu_linelock_lock(ea);
+    else spu_lockline_lock();
     pthread_t t;
     if (pthread_create(&t, NULL, llar_thread, NULL) != 0) {
-        spu_lockline_unlock();
+        if (hold_data_line) spu_linelock_unlock(ea);
+        else spu_lockline_unlock();
         return -1;
     }
     while (!atomic_load(&g_llar_entered)) YieldProcessor();
@@ -307,7 +309,8 @@ static int llar_completes_under_held_lock(uint32_t ea)
      * the harness's 30 s timeout killed a passing run. */
     for (int i = 0; i < 200 && !atomic_load(&g_llar_done); i++) Sleep(10);
     int done = atomic_load(&g_llar_done);
-    spu_lockline_unlock();
+    if (hold_data_line) spu_linelock_unlock(ea);
+    else spu_lockline_unlock();
     pthread_join(t, NULL);
     return done;
 }
@@ -319,12 +322,15 @@ static void test_registered_getllar_skips_the_lock(void)
     g_guest_mem[LINE_A + 5] = 0x77;
 
     TEST("a registered holder's GETLLAR of a marked line does not wait for the lock");
-    CHECK(llar_completes_under_held_lock(LINE_A) == 1);
+    CHECK(llar_completes_under_held_lock(LINE_A, 0) == 1);
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_A);
     CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
     CHECK_EQ_U32(g_a.resv_line[5], 0x77);
     CHECK_EQ_U32(g_a.atomic_stat, 4);
+
+    TEST("GETLLAR skips the data line lock for an ordinary registered line");
+    CHECK(llar_completes_under_held_lock(LINE_A, 1) == 1);
 
     TEST("...and the reservation it took is still ended by a peer's commit");
     stage(&g_b, LSA_B, 0xB0, 128);
@@ -335,7 +341,7 @@ static void test_registered_getllar_skips_the_lock(void)
     /* LINE_B has never been reserved, so its mark is set by this GETLLAR and
      * must be set under the lock. */
     TEST("a GETLLAR of an unmarked line still takes the lock");
-    CHECK(llar_completes_under_held_lock(LINE_B + 0x80) == 0);
+    CHECK(llar_completes_under_held_lock(LINE_B + 0x80, 0) == 0);
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_B + 0x80);
 
@@ -344,8 +350,18 @@ static void test_registered_getllar_skips_the_lock(void)
     TEST("an unregistered context's GETLLAR of a marked line still takes the lock");
     spu_coh_unregister(&g_a);
     CHECK(g_a.coh_listed == 0);
-    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
+    CHECK(llar_completes_under_held_lock(LINE_A, 0) == 0);
     CHECK(g_a.coh_listed == 1);
+
+    /* Use a separate line so the later lock-free race tests stay unmarked. */
+    const uint32_t event_flag_line = 0x80000;
+    g_guest_mem[event_flag_line + 5] = 0x77;
+    spu_mark_event_flag_line(event_flag_line);
+    spu_atomic(&g_a, LSA_A, event_flag_line, MFC_GETLLAR_CMD);
+    TEST("GETLLAR waits for a writer holding a registered EventFlag line");
+    CHECK(llar_completes_under_held_lock(event_flag_line, 1) == 0);
+    CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
+    CHECK_EQ_U32(g_a.resv_line[5], 0x77);
 }
 
 /* A write racing a lock-free GETLLAR, for real. Two threads are released

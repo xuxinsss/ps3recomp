@@ -91,6 +91,24 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+
+/* Event flags are read by the guest before it decides whether to arm a wait
+ * slot. The event bits, slot mask and task ID must come from one line image.
+ * Keep a monotonic bit per guest line so reinitializing a flag cannot open
+ * an unlocked read window. Ordinary atomic lines keep the fast path. */
+static uint32_t s_event_flag_lines[1u << (32 - 7 - 5)];
+
+void spu_mark_event_flag_line(uint32_t ea)
+{
+    __atomic_fetch_or(&s_event_flag_lines[ea >> 12], 1u << ((ea >> 7) & 31u),
+                      __ATOMIC_RELEASE);
+}
+
+static int spu_is_event_flag_line(uint32_t ea)
+{
+    return (__atomic_load_n(&s_event_flag_lines[ea >> 12], __ATOMIC_ACQUIRE) &
+            (1u << ((ea >> 7) & 31u))) != 0;
+}
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -746,15 +764,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         yz_lockstep_tick(ctx);
         /* A registered holder re-reading an already marked line -- every
          * policy-module poll -- publishes its reservation and copies without
-         * any lock; any write the copy misses ends that reservation (see
-         * spu_coh_reserve_fast). Anything else marks + registers under the
-         * table lock, then publishes BEFORE the copy (same order as the fast
-         * path, and the one the fence argument in spu_coherency.c documents):
-         * a writer that commits between the publish and the copy kills this
-         * reservation in its notify walk, so nothing is resurrected -- and a
-         * write landing mid-copy leaves this snapshot stale, which the PUTLLC
-         * compare then fails, the safe direction. The copy itself needs no
-         * lock: the 128-byte compare is the authority. */
+         * the reservation table lock. Otherwise mark and register under that
+         * lock, then publish before reading the line in both paths. A writer
+         * that races publication can invalidate the reservation through notify. */
         const int llar_fast = spu_coh_reserve_fast(ctx, ea);
         if (!llar_fast) {
             /* Tell the PPU store paths this line is live, so a store into it
@@ -770,35 +782,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
         }
 
-        /* ONE read of guest memory, then the snapshot from that copy.
-         *
-         * This used to memcpy from `mem` twice -- once to the local store, once
-         * to resv_line -- and a PPU store landing BETWEEN the two reads gave the
-         * SPU a stale line and a fresh snapshot. That is a permanent deadlock,
-         * and it is the one this port spent a session chasing: the SPU compares
-         * its (stale) copy, finds produced == consumed, and sleeps on
-         * MFC_LLR_LOST_EVENT; spu_resv_lost_poll then compares memory against a
-         * snapshot that ALREADY has the new value, finds no difference, and
-         * never raises the event. Measured at a freeze: mirror 0x9E, snapshot
-         * 0x9F, memory 0x9F, and the SPU polling rchcnt 1.6 billion times.
-         *
-         * Hardware cannot produce that state: GETLLAR is a single atomic
-         * 128-byte read, so the reserved data and the reservation come from the
-         * same instant. Copying the snapshot from `ls` restores that property,
-         * and a store that lands after the read now leaves BOTH stale -- which
-         * is what makes the lost-reservation event fire. */
-        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
-        /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
-         * single atomic 128-byte read, so the reserved data and the reservation
-         * come from the same instant. Reading guest memory twice lets a PPU store
-         * land between them, leaving the SPU a STALE line and a FRESH snapshot --
-         * and then both halves of the wait fail: the SPU compares its stale copy,
-         * sees produced == consumed and sleeps on MFC_LLR_LOST_EVENT, while the
-         * reservation poll compares memory against a snapshot that already holds
-         * the new value, finds no difference, and never raises the event. Nobody
-         * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
-         * stale, which is exactly what makes the lost-reservation event fire. */
-        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
+        /* EventFlag code can act on the read without a validating PUTLLC.
+         * Use the writers' line lock for those reads. The reservation
+         * snapshot comes from local store, not a second guest-memory read. */
+        if (spu_is_event_flag_line(ea)) {
+            spu_linelock_lock(ea);
+            memcpy(ls, mem, MFC_ATOMIC_LINE);
+            spu_linelock_unlock(ea);
+        } else {
+            memcpy(ls, mem, MFC_ATOMIC_LINE);
+        }
+        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
