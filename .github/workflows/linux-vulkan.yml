@@ -44,8 +44,14 @@ jobs:
       # mesa-vulkan-drivers; the validation layer is its own package.
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
+          # Runner Azure mirror is unavailable; keep packages and tests unchanged.
+          for source in /etc/apt/apt-mirrors.txt /etc/apt/apt-security-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
+            if [ -f "$source" ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|https://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$source"
+            fi
+          done
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y ninja-build libsdl2-dev clang \
             glslang-dev glslang-tools spirv-tools \
             libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
 
