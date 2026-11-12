@@ -329,6 +329,13 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
                                    u32* direction);
 
+
+/* Task2 HLE support: guest effective addresses, not native pointers. */
+s32 cellSpursCreateTask2WithBinInfo(u64 taskset_ea, u64 taskId_ea, u64 binInfo_ea,
+                                   u64 argument_ea, u64 context_ea);
+s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea);
+s32 cellSpursDestroyTaskset2(u64 taskset_ea);
+
 #ifdef __cplusplus
 }
 #endif

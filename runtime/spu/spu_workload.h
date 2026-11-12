@@ -151,6 +151,10 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t size, uint32_t args,
+                              uint32_t taskset, uint32_t id);
+void spu_taskset_cancel_running(uint32_t ea, uint32_t id);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

@@ -1590,8 +1590,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     return 0;
 }
 
-int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
-                                uint32_t args_ea)
+static int spu_dispatch_async_impl(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid, int explicit_task)
 {
     if (!image || image_size == 0) return 0;
 
@@ -1637,7 +1637,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * the next CreateTask overwriting the single-slot globals -- with two audio
      * tasks that made both run task 1's descriptor. */
     { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+      j->taskset_ea = explicit_task ? taskset_ea : g_ydkj_real_taskset_ea;
+      j->taskid = explicit_task ? taskid : g_ydkj_real_taskid; }
     /* Mark the task running NOW, not when its thread starts: in that gap another
      * task's exit saw it ready-but-not-running and started it a second time
      * (Twisted Metal's level-load inflate tasks each ran twice, concurrently). */
@@ -1647,7 +1648,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * async SPU thread reading it later would race the PPU stack. word1 is
      * overridden to args_ea (eaContext) in spu_run_lifted_job_abi. */
     j->have_r3 = 0;
-    if (args_ea) {
+    if (args_ea && !explicit_task) {
         extern uint8_t* vm_base;
         const uint8_t* c = vm_base + args_ea + 0x10;
         for (int k = 0; k < 4; k++)
@@ -1659,7 +1660,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
-    if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
+    if (args_ea && !explicit_task) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
             /* Dump a larger window of the task context buffer + scan for any word
              * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
@@ -1716,3 +1717,13 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 #endif
     return 1;
 }
+
+/* New Task2 callers pass identity as arguments rather than a process-global
+ * handoff. Keep the legacy entry for existing v1 and diagnostic callers. */
+int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t args)
+{ return spu_dispatch_async_impl(image,size,args,0,0,0); }
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t size, uint32_t args,
+                              uint32_t taskset, uint32_t id)
+{ return spu_dispatch_async_impl(image,size,args,taskset,id,1); }
+void spu_taskset_cancel_running(uint32_t ea, uint32_t id)
+{ spu_taskset_mark(ea,id,0); }

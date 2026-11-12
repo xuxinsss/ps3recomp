@@ -1178,6 +1178,217 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
 }
 
 /* =========================================================================
+ * Taskset2 / Task2 (CellSpurs2 family) -- spurs_test (D group), 2026-10-28.
+ *
+ * CellSpursTaskset2 layout (RPCS3 cellSpurs.h): identical to the v1 taskset
+ * through 0x189C, then task_exit_code[128] (16 bytes each) at 0x1980 --
+ * exit code as BE u32 at +8, byte 14 must stay 0 (non-zero reads as ESRCH),
+ * byte 15 low nibble = state (2 = exited, 4 = joined). Struct size 0x2900.
+ * All guest-memory accesses via the BE accessors per the spurs_taskset.h
+ * warning. The SPU runtime already maintains the exit records for tasksets
+ * registered with spu_taskset2_register() (spu_workload.c) once tasks run.
+ * =====================================================================*/
+enum {
+    TS2_EXITCODE      = 0x1980,   /* task_exit_code[128], 16 bytes each */
+    TS2_EXITCODE_STRIDE = 16,
+    TS2_ST_RUNNING    = 0,        /* byte15 low nibble: created, not exited */
+    TS2_ST_EXITED     = 2,
+    TS2_ST_JOINED     = 4,
+    TS2_STRUCT_END    = 0x2900,
+};
+
+/* Shared task-2 creation body (used by cellSpursCreateTask2WithBinInfo once
+ * its ABI is decoded). eaElf/context_ea/task_lsp are already resolved;
+ * task_arg is the 16-byte CellSpursTaskArgument (Task2's only channel into
+ * the SPU task's r3). Slot/bitset/TaskInfo machinery and the dispatch path
+ * are shared with cellSpursCreateTask (see its comments). */
+/* Serialize host Task2 create/join transactions. Guest exit publication uses
+ * the record's guest line lock; never hold that line while dispatching. */
+static SRWLOCK s_task2_api_lock = SRWLOCK_INIT;
+static int task2_range(u64 ea, u32 size)
+{ return ea <= UINT32_MAX && spurs_guest_range_valid((u32)ea,size); }
+static s32 spurs_create_task2_impl(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
+                                   u64 context_ea, const u32 task_arg[4],
+                                   const u32 task_lsp[4])
+{
+    if (!taskset_ea || !taskId_ea || !eaElf) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if ((taskset_ea & 127u) || (taskId_ea & 3u)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!task2_range(taskset_ea,TS2_STRUCT_END) || !task2_range(taskId_ea,4) ||
+        !task2_range(eaElf,0x34) || (context_ea && !task2_range(context_ea,0x180)))
+        return CELL_SPURS_TASK_ERROR_FAULT;
+    /* Reject truncated/unloadable images before publishing any task state. */
+    extern u32 ppu_vm_size;
+    u64 available=(ppu_vm_size ? (u64)ppu_vm_size : 0x100000000ull)-eaElf;
+    if (available > 2u*1024*1024) available=2u*1024*1024;
+    const uint8_t* elf=vm_base+(u32)eaElf;
+    size_t size=spu_elf_image_size(elf,(size_t)available);
+    u32 phoff=vm_read32((u32)eaElf+0x1c);
+    u32 phsize=vm_read16((u32)eaElf+0x2a), phcount=vm_read16((u32)eaElf+0x2c);
+    if (!size || vm_read16((u32)eaElf+18)!=23 || !phcount || phsize<32 || (u64)phoff+(u64)phsize*phcount>size ||
+        vm_read32((u32)eaElf+0x18)>=0x40000) return CELL_SPURS_TASK_ERROR_INVAL;
+    for(u32 i=0;i<phcount;i++) {
+        u32 ph=(u32)eaElf+phoff+i*phsize;
+        if(vm_read32(ph)!=1)continue;
+        u32 files=vm_read32(ph+16), memory=vm_read32(ph+20);
+        if(files>memory || (u64)vm_read32(ph+8)+memory>0x40000 ||
+           (u64)vm_read32(ph+4)+files>size) return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+    uint8_t* ls=(uint8_t*)malloc(0x40000);
+    if (!ls) return CELL_SPURS_TASK_ERROR_NOMEM;
+    u32 entry=0;
+    int valid=size && spu_elf_load_to_ls(elf,size,ls,&entry);
+    free(ls);
+    if (!valid) return CELL_SPURS_TASK_ERROR_INVAL;
+    AcquireSRWLockExclusive(&s_task2_api_lock);
+    if (vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
+        ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
+    }
+    u32 slot=spurs_taskset_take_slot((u32)taskset_ea,CELL_SPURS_MAX_TASK);
+    if (slot==CELL_SPURS_MAX_TASK) {
+        ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_NOMEM;
+    }
+    extern void spu_taskset_mark_running(uint32_t,uint32_t);
+    extern void spu_taskset2_set_exit(uint32_t,uint32_t,int,uint32_t);
+    u32 record=(u32)taskset_ea+TS2_EXITCODE+TS2_EXITCODE_STRIDE*slot;
+    u32 ti=spurs_taskset_taskinfo_ea((u32)taskset_ea,slot);
+    u8 old_info[0x30];
+    extern void spu_linelock_range(uint32_t,uint32_t);
+    extern void spu_linelock_range_unlock(uint32_t,uint32_t);
+    extern void spu_linelock_bump(uint32_t);
+    spu_linelock_range(ti,ti+0x2f);memcpy(old_info,vm_base+ti,sizeof(old_info));
+    spu_linelock_range_unlock(ti,ti+0x2f);
+    u8 old_record[16];
+    spu_linelock_lock(record);memcpy(old_record,vm_base+record,16);spu_linelock_unlock(record);
+    spu_taskset_mark_running((u32)taskset_ea,slot);
+    spu_taskset2_set_exit((u32)taskset_ea,slot,0,0);
+    spurs_taskset_add_task((u32)taskset_ea,slot,eaElf,context_ea,task_arg,task_lsp);
+    if (!spu_workload_dispatch_task(elf,(u32)size,(u32)context_ea,(u32)taskset_ea,slot)) {
+        /* Keep the runtime running guard until guest eligibility is removed. */
+        spurs_taskset_bitset_update((u32)taskset_ea+CSTS_READY,slot,0);
+        spurs_taskset_bitset_update((u32)taskset_ea+CSTS_PENDING_READY,slot,0);
+        spurs_taskset_bitset_update((u32)taskset_ea+CSTS_ENABLED,slot,0);
+        spu_linelock_range(ti,ti+0x2f);memcpy(vm_base+ti,old_info,sizeof(old_info));
+        for(u32 line=ti&~127u;line<=((ti+0x2f)&~127u);line+=128)spu_linelock_bump(line);
+        spu_linelock_range_unlock(ti,ti+0x2f);
+        for(u32 line=ti&~127u;line<=((ti+0x2f)&~127u);line+=128)spu_coh_notify_write(line);
+        spu_linelock_lock(record);memcpy(vm_base+record,old_record,16);
+        spu_linelock_release(record);spu_coh_notify_write(record);
+        spu_taskset_cancel_running((u32)taskset_ea,slot);
+        ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_NOMEM;
+    }
+    vm_write32((u32)taskId_ea,slot);
+    ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_OK;
+}
+
+/* cellSpursCreateTask2WithBinInfo(taskset, taskId*, binInfo, argument, eaContext)
+ * -- ABI CONFIRMED on spurs_test (2026-10-28) three ways: SPURS2_TRACE register
+ * dump (5 GPR args, a8/a9 unused), static ground truth in the guest ELF
+ * (binInfo->eaElf @0x23580 starts with the SPU ELF magic, one embedded image
+ * per ping-pong task), and RPCS3's SPU policy (spursTasksetStartTask hands the
+ * task r3 = TaskInfo.args, r4 = taskset, pc = entry).
+ * CellSpursTaskBinInfo: eaElf u64@0x00, sizeContext u32@0x08, lsPattern u64@0x10.
+ * r6 = the 16-byte CellSpursTaskArgument (each ping-pong task's event-flag
+ * bit rides in word 0), r7 = the per-task context save buffer (sizeContext).
+ * SPURS2_TRACE register/binInfo/argument dumps are gated behind the env var. */
+s32 cellSpursCreateTask2WithBinInfo(u64 taskset_ea, u64 taskId_ea, u64 binInfo_ea,
+                                    u64 argument_ea, u64 eaContext)
+{
+    if (!taskset_ea || !taskId_ea || !binInfo_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!task2_range(taskset_ea,TS2_STRUCT_END) || !task2_range(taskId_ea,4) ||
+        !task2_range(binInfo_ea,32) || (argument_ea && !task2_range(argument_ea,16)))
+        return CELL_SPURS_TASK_ERROR_FAULT;
+    if ((binInfo_ea & 15u) || (argument_ea & 15u) || (eaContext & 127u))
+        return CELL_SPURS_TASK_ERROR_ALIGN;
+    u32 context_size=vm_read32((u32)binInfo_ea+8);
+    if (context_size && (!eaContext || !task2_range(eaContext,context_size)))
+        return CELL_SPURS_TASK_ERROR_FAULT;
+    u64 eaElf = 0;
+    u32 task_lsp[4] = {0, 0, 0, 0};
+    if (binInfo_ea) {
+        if (!spurs_guest_range_valid((u32)binInfo_ea, 32)) return (s32)0x8041090Du;
+        eaElf = vm_read64((u32)binInfo_ea + 0x00);
+        for (int i = 0; i < 4; i++) task_lsp[i] = vm_read32((u32)binInfo_ea + 0x10 + i * 4);
+    }
+    u32 task_arg[4] = {0, 0, 0, 0};
+    if (argument_ea) {
+        if (!spurs_guest_range_valid((u32)argument_ea, 16)) return (s32)0x8041090Du;
+        for (int i = 0; i < 4; i++) task_arg[i] = vm_read32((u32)argument_ea + i * 4);
+    }
+    return spurs_create_task2_impl(taskset_ea, taskId_ea, eaElf, eaContext,
+                                   task_arg, task_lsp);
+}
+
+/* cellSpursJoinTask2(taskset, taskId, exitCode*): wait for the task's
+ * task_exit_code record (state 2), mark it joined (4), hand the BE exit
+ * code to the caller. Blocks like the real firmware; unblocks when the
+ * SPU task exit path (spu_taskset2_set_exit) publishes the record. */
+s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
+{
+    if (!taskset_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskId>=CELL_SPURS_MAX_TASK) return CELL_SPURS_TASK_ERROR_INVAL;
+    if ((taskset_ea&127u)||(exitCode_ea&3u)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!task2_range(taskset_ea,TS2_STRUCT_END) ||
+        (exitCode_ea && !task2_range(exitCode_ea,4))) return CELL_SPURS_TASK_ERROR_FAULT;
+    u32 rec=(u32)taskset_ea+TS2_EXITCODE+TS2_EXITCODE_STRIDE*taskId;
+    for (;;) {
+        AcquireSRWLockExclusive(&s_task2_api_lock);
+        if (vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
+            ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
+        }
+        spu_linelock_lock(rec);
+        u8* e=vm_base+rec;
+        u8 invalid=e[14], state=e[15]&15u;
+        u32 code=((u32)e[8]<<24)|((u32)e[9]<<16)|((u32)e[10]<<8)|e[11];
+        if (!invalid && state==TS2_ST_EXITED) {
+            e[15]=(u8)((e[15]&0xf0u)|TS2_ST_JOINED);
+            spu_linelock_release(rec);
+            spu_coh_notify_write(rec);
+        } else spu_linelock_unlock(rec);
+        int live=1;
+        if(!invalid && state==TS2_ST_RUNNING) {
+            u32 enabled=(u32)taskset_ea+CSTS_ENABLED+taskId/8;
+            spu_linelock_lock(enabled);
+            live=(vm_base[enabled]&(0x80u>>(taskId%8)))!=0;
+            spu_linelock_unlock(enabled);
+        }
+        ReleaseSRWLockExclusive(&s_task2_api_lock);
+        if (invalid) return CELL_SPURS_TASK_ERROR_SRCH;
+        if (!live) {
+            spu_linelock_lock(rec);
+            u8 latest=vm_base[rec+15]&15u;
+            spu_linelock_unlock(rec);
+            if(latest==TS2_ST_EXITED || latest==TS2_ST_JOINED)continue;
+            return CELL_SPURS_TASK_ERROR_SRCH;
+        }
+        /* Preserve the local support patch's cached rejoin behavior pending a
+         * firmware trace; do not claim this is a general SDK contract. */
+        if (state==TS2_ST_EXITED || state==TS2_ST_JOINED) {
+            if(exitCode_ea) vm_write32((u32)exitCode_ea,code);
+            return CELL_OK;
+        }
+        Sleep(5);
+    }
+}
+
+s32 cellSpursDestroyTaskset2(u64 taskset_ea)
+{
+    if (!taskset_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskset_ea&127u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!task2_range(taskset_ea,TS2_STRUCT_END)) return CELL_SPURS_TASK_ERROR_FAULT;
+    AcquireSRWLockExclusive(&s_task2_api_lock);
+    spu_linelock_lock((u32)taskset_ea);
+    int busy=0;
+    for(u32 i=0;i<16;i++) busy|=vm_base[(u32)taskset_ea+CSTS_ENABLED+i] |
+        vm_base[(u32)taskset_ea+CSTS_RUNNING+i] | vm_base[(u32)taskset_ea+CSTS_READY+i] |
+        vm_base[(u32)taskset_ea+CSTS_PENDING_READY+i];
+    spu_linelock_unlock((u32)taskset_ea);
+    ReleaseSRWLockExclusive(&s_task2_api_lock);
+    /* Real shutdown must retire host registrations and lv2 event flags.
+     * Until that lifecycle is implemented, never report a fictitious teardown. */
+    return busy ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_NOSYS;
+}
+
+/* =========================================================================
  * Task
  * =====================================================================*/
 
