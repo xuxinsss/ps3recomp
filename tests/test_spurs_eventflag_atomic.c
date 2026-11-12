@@ -1,10 +1,12 @@
 /* Manufactured policy modules exercise the real initializer, scheduler and
  * SPU policy execution. No game code, addresses or completion substitutions. */
+#define spu_coh_notify_write fixture_eventflag_notify
 #define spu_linelock_lock fixture_eventflag_lock
 #define spu_taskset_signal_task fixture_signal_task
 #define spu_workload_dispatch_async fixture_unbounded_dispatch
 #include "../libs/spurs/cellSpurs.c"
 #undef spu_workload_dispatch_async
+#undef spu_coh_notify_write
 #undef spu_linelock_lock
 #undef spu_taskset_signal_task
 #include <assert.h>
@@ -30,7 +32,20 @@ void spu_thread_publish_ctx(uint32_t tid,void* c){(void)tid;(void)c;}
 void ydkj_wake_all_event_flags(void){}
 
 static atomic_uint attempted, completed, signaled;
-static atomic_int watching;
+void spu_linelock_lock(uint32_t);
+static atomic_int watching, reuse_slot;
+void spu_coh_notify_write(uint32_t);
+/* Force slot reuse after the guest transaction is published, before signal.
+ * Notification is still performed by the production coherency implementation. */
+void fixture_eventflag_notify(uint32_t ea)
+{
+    spu_coh_notify_write(ea);
+    if (ea==0x10000u && atomic_exchange(&reuse_slot,0)) {
+        spu_linelock_lock(ea);
+        vm_base[ea+EF_WAITING_TASK_ID]=42;
+        spu_linelock_release(ea);
+    }
+}
 void spu_linelock_lock(uint32_t);
 void fixture_eventflag_lock(uint32_t ea)
 {
@@ -84,6 +99,7 @@ static void run_transaction(unsigned op, unsigned clear_mode)
         ef_w16(FLAG+EF_SPU_USED_SLOTS,0x8000);
         ef_w16(FLAG+EF_SPU_WAIT_MASK_ARR,1);
         vm_base[FLAG+EF_WAITING_TASK_ID]=7;
+        atomic_store(&reuse_slot,1);
     }
     /* A distinct event posted by the writer must survive consuming bit 1. */
     ef_w16(FLAG+EF_EVENTS,3);
@@ -92,6 +108,7 @@ static void run_transaction(unsigned op, unsigned clear_mode)
     assert(result==0);
     if(op==0) {
         assert(atomic_load(&signaled)==1);
+        assert(vm_base[FLAG+EF_WAITING_TASK_ID]==42);
         assert(ef_r16(FLAG+EF_PENDING_RECV_EVT)==1);
         assert(ef_r16(FLAG+EF_SPU_PENDING_RECV)==0x8000);
     }
