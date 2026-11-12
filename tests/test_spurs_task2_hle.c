@@ -252,7 +252,7 @@ static int64_t flag_wait_result;
 static void* flag_waiter(void* arg)
 {
     ppu_context ctx={0};ctx.gpr[3]=*(u32*)arg;ctx.gpr[4]=1;
-    ctx.gpr[5]=SYS_EVENT_FLAG_WAIT_OR;ctx.gpr[7]=3000000;
+    ctx.gpr[5]=SYS_EVENT_FLAG_WAIT_OR; /* released explicitly, never by a deadline */
     flag_wait_result=sys_event_flag_wait(&ctx);return NULL;
 }
 static void lifecycle(void)
