@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include "../runtime/spu/spu_coherency.h"
+#include "../runtime/syscalls/sys_event.h"
 
 void spu_indirect_branch(spu_context*);
 void spu_halt(spu_context*);
@@ -18,16 +19,11 @@ uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
 unsigned long long ps3_ms_now(void) { LARGE_INTEGER n,f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f); return n.QuadPart*1000/f.QuadPart; }
 void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
-/* A commit to a registered taskset's first line starts its pending tasks,
- * which keeps spu_async_run's task start in the link. This fixture makes
- * no taskset, so none of these is called. */
+/* Manufacture an entry/context rather than executing proprietary guest code. */
 uint64_t spurs_pm_build_context(uint8_t* ls,uint32_t ts,uint32_t id,uint32_t spu,uint32_t tag)
 {(void)ls;(void)ts;(void)id;(void)spu;(void)tag;return 0;}
 void spu_thread_publish_ctx(uint32_t tid,void* c){(void)tid;(void)c;}
-void ydkj_wake_all_event_flags(void){}
 
-void sys_event_queue_cancel_by_id(u32 id){(void)id;}
-void sys_event_queue_uncancel_by_id(u32 id){(void)id;}
 int spu_workload_dispatch_task(const uint8_t*,uint32_t,uint32_t,uint32_t,uint32_t);
 void spu_linelock_lock(uint32_t);
 static atomic_uint watched_record,join_arrived,join_done;
@@ -90,9 +86,118 @@ static void* create_worker(void* arg)
     }
     return NULL;
 }
-int main(void)
+static s32 create_taskset(u64 ea)
+{ return cellSpursCreateTaskset2((CellSpurs*)(uintptr_t)0x1000,
+                               (CellSpursTaskset*)(uintptr_t)ea, 0); }
+static unsigned active_flags(void)
 {
+    unsigned n=0;
+    for(unsigned i=0;i<SYS_EVENT_FLAG_MAX;i++)n+=!!g_sys_event_flags[i].active;
+    return n;
+}
+static atomic_uint reserve_ready,reserve_go;
+static void* reserve_worker(void* result)
+{
+    atomic_fetch_add(&reserve_ready,1);
+    while(!atomic_load(&reserve_go))Sleep(0);
+    *(int*)result=spu_taskset2_prepare(0x70000);
+    return NULL;
+}
+static void unpublished_taskset(void)
+{
+    pthread_t threads[8];int results[8];
+    for(unsigned i=0;i<8;i++)
+        assert(pthread_create(&threads[i],NULL,reserve_worker,&results[i])==0);
+    for(unsigned i=0;i<2000 && atomic_load(&reserve_ready)!=8;i++)Sleep(1);
+    assert(atomic_load(&reserve_ready)==8);atomic_store(&reserve_go,1);
+    unsigned winners=0;
+    for(unsigned i=0;i<8;i++) {
+        pthread_join(threads[i],NULL);
+        assert(results[i]==1 || results[i]==-1);winners+=results[i]==1;
+    }
+    assert(winners==1 && !spu_taskset2_is_registered(0x70000));
+    /* Even an eligible guest task cannot run while flags/metadata are still
+     * being initialized. Exercise the real commit callback and scheduler. */
+    spurs_taskset_init(0x70000,0x1000,0,0,TS2_STRUCT_END,0,0);
+    const u32 zero[4]={0};
+    spurs_taskset_add_task(0x70000,0,ELF,0,zero,zero);
+    spurs_taskset_bitset_update(0x70000+CSTS_PENDING_READY,0,1);
+    extern void spu_taskset_line_committed(uint32_t);
+    spu_taskset_line_committed(0x70000);
+    assert(vm_base[0x70000+CSTS_PENDING_READY]&0x80);
+    assert(vm_base[0x70000+CSTS_ENABLED]&0x80);
+    spu_taskset2_abort(0x70000);
+    memset(vm_base+0x70000,0xa5,TS2_STRUCT_END);
+    extern void spu_taskset_start_pending(uint32_t);
+    spu_taskset_start_pending(0x70000); /* delayed callback after abort */
+    for(unsigned i=0;i<TS2_STRUCT_END;i++)assert(vm_base[0x70000+i]==0xa5);
+    assert(spu_taskset2_prepare(0x70000)==1);
+    spu_taskset2_abort(0x70000);
+    puts("Taskset2 concurrent reservation and unpublished scheduling guard: PASS");
+}
+static void assert_failed_taskset(u32 ea)
+{
+    memset(vm_base+ea,0xa5,TS2_STRUCT_END);
+    u32 old_ts=g_ydkj_real_taskset_ea,old_spurs=g_ydkj_real_spurs_ea;
+    unsigned before=active_flags();
+    assert(create_taskset(ea)==CELL_SPURS_TASK_ERROR_NOMEM);
+    for(unsigned i=0;i<TS2_STRUCT_END;i++)assert(vm_base[ea+i]==0xa5);
+    assert(active_flags()==before && !spu_taskset2_is_registered(ea));
+    assert(g_ydkj_real_taskset_ea==old_ts && g_ydkj_real_spurs_ea==old_spurs);
+}
+static void taskset_creation_failures(void)
+{
+    /* Actual lv2 allocation exhaustion: first flag fails, then only the
+     * second fails. Repetition catches leaked flags and prepared slots. */
+    u32 flags[SYS_EVENT_FLAG_MAX];
+    for(unsigned i=0;i<SYS_EVENT_FLAG_MAX;i++) {
+        assert(sys_event_flag_create_host(OUT,0)==0);flags[i]=vm_read32(OUT);
+    }
+    for(unsigned i=0;i<20;i++)assert_failed_taskset(0x20000);
+    assert(sys_event_flag_destroy_host(flags[SYS_EVENT_FLAG_MAX-1])==0);
+    for(unsigned i=0;i<40;i++)assert_failed_taskset(0x20000);
+    for(unsigned i=0;i<SYS_EVENT_FLAG_MAX-1;i++)
+        assert(sys_event_flag_destroy_host(flags[i])==0);
+    assert(active_flags()==0);
+    assert(cellSpursCreateTaskset2((CellSpurs*)(uintptr_t)0x1000,
+        (CellSpursTaskset*)(uintptr_t)0x100020000ull,0)==CELL_SPURS_TASK_ERROR_FAULT);
+    assert(cellSpursCreateTaskset2((CellSpurs*)(uintptr_t)0x1000,
+        (CellSpursTaskset*)(uintptr_t)0x20000,0x100030000ull)==CELL_SPURS_TASK_ERROR_FAULT);
+    assert(_cellSpursTasksetAttribute2Initialize(0x100030000ull,1)==CELL_SPURS_TASK_ERROR_FAULT);
+    /* A committed object cannot be initialized again over its tasks/flags. */
+    assert(create_taskset(0x20000)==0 && active_flags()==2);
+    assert(spu_taskset2_is_registered(0x20000));
+    assert(create(0x20000,OUT,BIN)==0);
+    assert(cellSpursJoinTask2(0x20000,vm_read32(OUT),CODE)==0);
+    u8 saved[TS2_STRUCT_END];memcpy(saved,vm_base+0x20000,sizeof saved);
+    assert(create_taskset(0x20000)==CELL_SPURS_TASK_ERROR_BUSY);
+    assert(!memcmp(saved,vm_base+0x20000,sizeof saved) && active_flags()==2);
+    /* Keep the existing capacities: the eight-entry running directory is
+     * now checked at creation, rather than silently losing duplicate guards. */
+    const u32 addresses[]={0x28000,0x48000,0x50000,0x58000,0x60000};
+    for(unsigned i=0;i<sizeof addresses/sizeof addresses[0];i++)
+        assert(create_taskset(addresses[i])==0);
+    assert(active_flags()==12); /* two manufactured tasksets already reserved */
+    assert_failed_taskset(0x68000);
+    puts("Taskset2 allocation rollback and bounded registration: PASS");
+}
+int main(int argc,char** argv)
+{
+    (void)argv;
     vm_base=calloc(1,ppu_vm_size);assert(vm_base);
+    s_inst[0].ea=0x1000;
+    if(argc>1) {
+        extern void spu_taskset_register(uint32_t);
+        assert(spu_taskset2_prepare(0x70000)==1);
+        assert(spu_taskset2_prepare(0x68000)==1);
+        spu_taskset2_abort(0x70000); /* a hole before an existing key */
+        spu_taskset_register(0x68000); /* must not duplicate the key into it */
+        for(unsigned i=0;i<31;i++)spu_taskset_register(0x100000+i*0x8000);
+        spu_taskset2_abort(0x68000);
+        spu_taskset_register(0x300000);
+        assert_failed_taskset(TS);
+        puts("Taskset2 full scheduling directory: PASS");return 0;
+    }
     init_ts(TS);init_ts(TS_B);
     unchanged_failure(CELL_SPURS_TASK_ERROR_NULL_POINTER,TS,OUT,0);
     unchanged_failure(CELL_SPURS_TASK_ERROR_FAULT,0x100010000ull,OUT,BIN);
@@ -110,6 +215,7 @@ int main(void)
     vm_write64(BIN,ELF);
     vm_write32(0x20000+CSTS_SIZE_FIELD,TS2_STRUCT_END);
     assert(create(0x20000,OUT,BIN)==CELL_SPURS_TASK_ERROR_STAT);
+    assert(cellSpursDestroyTaskset2(0x20000)==CELL_SPURS_TASK_ERROR_STAT);
     /* Missing lift: real dispatch failure must not publish an output id,
      * leave enabled/ready bits, or destroy the previous exit record. */
     u32 rec=TS+TS2_EXITCODE;vm_base[rec+15]=4;vm_write32(rec+8,0x12345678);
@@ -164,5 +270,7 @@ int main(void)
     spurs_taskset_bitset_update(TS+CSTS_ENABLED,5,0);
     assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_NOSYS);
     assert(dispatch_calls>=4);
+    unpublished_taskset();
+    taskset_creation_failures();
     puts("Task2 HLE safety and explicit dispatch: PASS");return 0;
 }

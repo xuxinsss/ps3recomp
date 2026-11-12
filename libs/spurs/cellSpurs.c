@@ -1005,9 +1005,12 @@ static int spurs_guest_range_valid(u32 ea, u32 bytes)
  * Taskset
  * =====================================================================*/
 
+/* Also covers Taskset2 preparation/publication and Task2 create/join. */
+static SRWLOCK s_task2_api_lock = SRWLOCK_INIT;
+
 static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                                 u64 args, const u8* priority, u32 maxContention,
-                                u32 taskset_size)
+                                u32 taskset_size, int publish)
 {
     (void)args; (void)priority; (void)maxContention;
 
@@ -1040,13 +1043,14 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
      * little-endian = garbage to the SPU). Overwrites 0x00-0x80 with BE fields. */
     spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
                        taskset_size, /*evf1*/0, /*evf2*/0);
-    g_ydkj_real_taskset_ea = taskset_ea;
-
-    g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
     /* Known to the runtime from now on, so tasks an SPU creates in it start
      * (spu_taskset_line_committed). */
     extern void spu_taskset_register(uint32_t ea);
-    spu_taskset_register(taskset_ea);
+    if (publish) {
+        g_ydkj_real_taskset_ea = taskset_ea;
+        g_ydkj_real_spurs_ea = spurs_ea;
+        spu_taskset_register(taskset_ea);
+    }
     printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
     return CELL_OK;
 }
@@ -1055,7 +1059,7 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                            u64 args, const u8* priority, u32 maxContention)
 {
     return spurs_create_taskset(spurs, taskset, args, priority, maxContention,
-                                CSTS_STRUCT_END);
+                                CSTS_STRUCT_END, 1);
 }
 
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
@@ -1069,7 +1073,7 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
     if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
-    return spurs_create_taskset(spurs, taskset, attr_h->args, NULL, 0, size);
+    return spurs_create_taskset(spurs, taskset, attr_h->args, NULL, 0, size, 1);
 }
 
 /* CellSpursTasksetAttribute2 (128 bytes, big-endian in guest memory):
@@ -1088,7 +1092,9 @@ enum {
 s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision)
 {
     if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    if (!spurs_guest_range_valid((u32)attr_ea, TS2ATTR_SIZE)) return (s32)0x8041090Du;
+    if (attr_ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (attr_ea > UINT32_MAX || !spurs_guest_range_valid((u32)attr_ea, TS2ATTR_SIZE))
+        return CELL_SPURS_TASK_ERROR_FAULT;
     memset(vm_base + (u32)attr_ea, 0, TS2ATTR_SIZE);
     vm_write32((u32)attr_ea + TS2ATTR_REVISION, revision);
     memset(vm_base + (u32)attr_ea + TS2ATTR_PRIORITY, 1, 8);
@@ -1100,6 +1106,14 @@ s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision)
  * a null attr means the defaults above. */
 s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 attr_ea)
 {
+    u64 ts = (uintptr_t)taskset, owner = (uintptr_t)spurs;
+    if (!ts || !owner) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if ((ts & 127u) || (attr_ea & 7u)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (ts > UINT32_MAX || owner > UINT32_MAX || attr_ea > UINT32_MAX ||
+        !spurs_guest_range_valid((u32)ts, SPURS_TASKSET2_SIZE) ||
+        (attr_ea && !spurs_guest_range_valid((u32)attr_ea, TS2ATTR_SIZE)))
+        return CELL_SPURS_TASK_ERROR_FAULT;
+    if (!spurs_inst_find((u32)owner)) return CELL_SPURS_CORE_ERROR_STAT;
     u64 args = 0;
     u32 maxContention = 8;
     if (attr_ea) {
@@ -1108,23 +1122,43 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 att
         maxContention = vm_read32((u32)attr_ea + TS2ATTR_MAX_CONT);
         if (vm_read32((u32)attr_ea + TS2ATTR_NAME_BUF) & 0xFu) return CELL_SPURS_TASK_ERROR_ALIGN;
     }
-    if (((u32)(uintptr_t)taskset) & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
-    s32 rc = spurs_create_taskset(spurs, taskset, args, NULL, maxContention, SPURS_TASKSET2_SIZE);
-    if (rc == CELL_OK) {
-        u32 ts_ea = (u32)(uintptr_t)taskset;
-        /* Only a Taskset2 has the task exit-code array (+0x1980) that the SPU
-         * side of cellSpursJoinTask2 reads; the runtime fills it on task exit
-         * for the tasksets registered here. */
-        extern void spu_taskset2_register(uint32_t ea);
-        spu_taskset2_register(ts_ea);
-        /* A Taskset2 also carries two lv2 event flags (ids at +0x1898 and
-         * +0x189C), and the SPU task library refuses to create a task in a
-         * taskset whose flags are 0 (CELL_SPURS_TASK_ERROR_PERM). God of War:
-         * Ascension's tasks start their next phase that way, from the SPU. */
-        extern int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern);
-        sys_event_flag_create_host(ts_ea + CSTS_EVENT_FLAG_ID1, 0);
-        sys_event_flag_create_host(ts_ea + CSTS_EVENT_FLAG_ID2, 0);
+    u8* saved = malloc(SPURS_TASKSET2_SIZE);
+    if (!saved) return CELL_SPURS_TASK_ERROR_NOMEM;
+    AcquireSRWLockExclusive(&s_task2_api_lock);
+    int reserved = spu_taskset2_prepare((u32)ts);
+    if (reserved != 1) {
+        ReleaseSRWLockExclusive(&s_task2_api_lock); free(saved);
+        return reserved < 0 ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_NOMEM;
     }
+    memcpy(saved, vm_base + (u32)ts, SPURS_TASKSET2_SIZE);
+    s32 rc = spurs_create_taskset(spurs, taskset, args, NULL, maxContention,
+                                 SPURS_TASKSET2_SIZE, 0);
+    /* These flags are private to an unpublished object. On a partial failure
+     * no task can have acquired them, so destroying the first one is safe. */
+    extern int64_t sys_event_flag_create_host(uint32_t, uint64_t);
+    extern int64_t sys_event_flag_destroy_host(uint32_t);
+    u32 first_flag = 0;
+    if (rc == CELL_OK) {
+        if (sys_event_flag_create_host((u32)ts + CSTS_EVENT_FLAG_ID1, 0) != CELL_OK)
+            rc = CELL_SPURS_TASK_ERROR_NOMEM;
+        else {
+            first_flag = vm_read32((u32)ts + CSTS_EVENT_FLAG_ID1);
+            if (sys_event_flag_create_host((u32)ts + CSTS_EVENT_FLAG_ID2, 0) != CELL_OK) {
+                sys_event_flag_destroy_host(first_flag);
+                rc = CELL_SPURS_TASK_ERROR_NOMEM;
+            }
+        }
+    }
+    if (rc == CELL_OK) {
+        g_ydkj_real_taskset_ea = (u32)ts;
+        g_ydkj_real_spurs_ea = (u32)owner;
+        spu_taskset2_commit((u32)ts);
+    } else {
+        memcpy(vm_base + (u32)ts, saved, SPURS_TASKSET2_SIZE);
+        spu_taskset2_abort((u32)ts);
+    }
+    ReleaseSRWLockExclusive(&s_task2_api_lock);
+    free(saved);
     return rc;
 }
 
@@ -1204,7 +1238,6 @@ enum {
  * are shared with cellSpursCreateTask (see its comments). */
 /* Serialize host Task2 create/join transactions. Guest exit publication uses
  * the record's guest line lock; never hold that line while dispatching. */
-static SRWLOCK s_task2_api_lock = SRWLOCK_INIT;
 static int task2_range(u64 ea, u32 size)
 { return ea <= UINT32_MAX && spurs_guest_range_valid((u32)ea,size); }
 static s32 spurs_create_task2_impl(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
@@ -1378,6 +1411,10 @@ s32 cellSpursDestroyTaskset2(u64 taskset_ea)
     if (taskset_ea&127u) return CELL_SPURS_TASK_ERROR_ALIGN;
     if (!task2_range(taskset_ea,TS2_STRUCT_END)) return CELL_SPURS_TASK_ERROR_FAULT;
     AcquireSRWLockExclusive(&s_task2_api_lock);
+    if (!spu_taskset2_is_registered((u32)taskset_ea) ||
+        vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
+        ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
+    }
     spu_linelock_lock((u32)taskset_ea);
     int busy=0;
     for(u32 i=0;i<16;i++) busy|=vm_base[(u32)taskset_ea+CSTS_ENABLED+i] |

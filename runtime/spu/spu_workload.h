@@ -155,6 +155,11 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t size, uint32_t arg
                               uint32_t taskset, uint32_t id);
 void spu_taskset_cancel_running(uint32_t ea, uint32_t id);
 int spu_taskset2_is_registered(uint32_t ea);
+/* Reserve before initialization: 1 = reserved, 0 = full, -1 = already known.
+ * Only unpublished reservations can be aborted. No live teardown is implied. */
+int spu_taskset2_prepare(uint32_t ea);
+void spu_taskset2_commit(uint32_t ea);
+void spu_taskset2_abort(uint32_t ea);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);

@@ -151,6 +151,8 @@ int64_t sys_event_port_send(ppu_context* ctx);
 /* Event Flags */
 int64_t sys_event_flag_create(ppu_context* ctx);
 int64_t sys_event_flag_destroy(ppu_context* ctx);
+int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern);
+int64_t sys_event_flag_destroy_host(uint32_t flag_id);
 int64_t sys_event_flag_wait(ppu_context* ctx);
 int64_t sys_event_flag_trywait(ppu_context* ctx);
 int64_t sys_event_flag_set(ppu_context* ctx);

@@ -1254,6 +1254,15 @@ int64_t sys_event_flag_destroy(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Host callers use the same table and destruction path as guest syscalls. */
+int64_t sys_event_flag_destroy_host(uint32_t flag_id)
+{
+    ppu_context c;
+    memset(&c, 0, sizeof c);
+    c.gpr[3] = flag_id;
+    return sys_event_flag_destroy(&c);
+}
+
 /* Check if wait condition is met */
 static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
 {

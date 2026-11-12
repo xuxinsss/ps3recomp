@@ -17,5 +17,7 @@ with tempfile.TemporaryDirectory(prefix='task2-hle-') as tmp:
         str(r/'tests/test_spurs_task2_hle.c'),
         *[str(r/'runtime/spu'/f'{u}.c') for u in units],
         str(r/'libs/spurs/spurs_taskset.c'),
+        str(r/'runtime/syscalls/sys_event.c'),
         str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
     subprocess.run([str(out)],check=True,timeout=30)
+    subprocess.run([str(out),'--directory-full'],check=True,timeout=30)

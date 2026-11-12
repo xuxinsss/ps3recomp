@@ -513,6 +513,10 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
  * the ELF EA at +0x14 and the context save EA at +0x1C. */
 #define TS_TRACK 8
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
+#define SPU_TASKSETS_MAX 32
+static uint32_t s_tasksets[SPU_TASKSETS_MAX];
+static int s_tasksets_hw;
+static uint32_t s_ts2_prepared[16];
 static volatile LONG s_ts_lock;
 static _Thread_local int s_ts_held;   /* this thread holds s_ts_lock */
 static uint8_t* ts_running(uint32_t taskset_ea)
@@ -548,16 +552,76 @@ void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t t)
      * (Havok's master SPU task does) retried forever and the PPU waited on it.
      * Only Taskset2s have the array -- a v1 taskset ends at 0x1900. */
 static uint32_t s_ts2[16];
-void spu_taskset2_register(uint32_t ea)
+/* Prepared entries reserve all three bounded directories before HLE writes
+ * guest memory. They are invisible to exit publication and scheduling until
+ * commit; abort only retires an unpublished entry, never a live taskset. */
+int spu_taskset2_prepare(uint32_t ea)
 {
-    if(!ea)return;
-    for(int i=0;i<16;i++) {
-        uint32_t current=__atomic_load_n(&s_ts2[i],__ATOMIC_ACQUIRE);
-        if(current==ea)return;
-        if(!current) {
-            if(__atomic_compare_exchange_n(&s_ts2[i],&current,ea,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE) || current==ea)return;
+    if (!ea) return 0;
+    ts_lock();
+    int slot = -1, run_slot = -1, directory_slot = -1;
+    for (int i = 0; i < 16; i++) {
+        if (s_ts2[i] == ea || s_ts2_prepared[i] == ea) {
+            ts_unlock(); return -1;
+        }
+        if (!s_ts2[i] && !s_ts2_prepared[i] && slot < 0) slot = i;
+    }
+    for (int i = 0; i < TS_TRACK; i++) {
+        if (s_ts_run[i].ea == ea) { ts_unlock(); return -1; }
+        if (!s_ts_run[i].ea && run_slot < 0) run_slot = i;
+    }
+    for (int i = 0; i < SPU_TASKSETS_MAX; i++)
+        if (__atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE) == ea) {
+            ts_unlock(); return -1;
+        }
+    if (slot < 0 || run_slot < 0) { ts_unlock(); return 0; }
+    __atomic_store_n(&s_ts2_prepared[slot], ea, __ATOMIC_RELEASE);
+    for (int i = 0; i < SPU_TASKSETS_MAX; i++) {
+        uint32_t empty = 0;
+        if (__atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE)) continue;
+        if (i >= s_tasksets_hw) __atomic_store_n(&s_tasksets_hw, i + 1, __ATOMIC_RELEASE);
+        if (__atomic_compare_exchange_n(&s_tasksets[i], &empty, ea, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            directory_slot = i; break;
         }
     }
+    if (directory_slot < 0) {
+        __atomic_store_n(&s_ts2_prepared[slot], 0, __ATOMIC_RELEASE);
+        ts_unlock(); return 0;
+    }
+    s_ts_run[run_slot].ea = ea;
+    memset(s_ts_run[run_slot].running, 0, 16);
+    ts_unlock(); return 1;
+}
+void spu_taskset2_commit(uint32_t ea)
+{
+    ts_lock();
+    for (int i = 0; i < 16; i++) if (s_ts2_prepared[i] == ea && ea) {
+        __atomic_store_n(&s_ts2[i], ea, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_ts2_prepared[i], 0, __ATOMIC_RELEASE);
+        break;
+    }
+    ts_unlock();
+}
+void spu_taskset2_abort(uint32_t ea)
+{
+    ts_lock();
+    for (int i = 0; i < 16; i++) if (s_ts2_prepared[i] == ea && ea) {
+        for (int j = 0; j < SPU_TASKSETS_MAX; j++) {
+            uint32_t expected = ea;
+            __atomic_compare_exchange_n(&s_tasksets[j], &expected, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        }
+        for (int j = 0; j < TS_TRACK; j++) if (s_ts_run[j].ea == ea)
+            memset(&s_ts_run[j], 0, sizeof(s_ts_run[j]));
+        __atomic_store_n(&s_ts2_prepared[i], 0, __ATOMIC_RELEASE);
+        break;
+    }
+    ts_unlock();
+}
+void spu_taskset2_register(uint32_t ea)
+{
+    if (spu_taskset2_prepare(ea) == 1) spu_taskset2_commit(ea);
 }
 int spu_taskset2_is_registered(uint32_t ea)
 {
@@ -595,6 +659,19 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     extern void spu_linelock_bump(uint32_t);
     extern void spu_coh_notify_write(uint32_t);
     ts_lock(); s_ts_held = 1;
+    /* A commit callback may have read its directory entry just before an
+     * initialization abort removed it. Recheck after taking the writer lock,
+     * before interpreting restored guest bytes as scheduling metadata. */
+    if (done_task == UINT32_MAX) {
+        int known = 0;
+        for (int i = 0; i < SPU_TASKSETS_MAX; i++)
+            known |= __atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE) == taskset_ea;
+        if (!known) { s_ts_held = 0; ts_unlock(); return; }
+    }
+    for (int i = 0; i < 16; i++)
+        if (__atomic_load_n(&s_ts2_prepared[i], __ATOMIC_ACQUIRE) == taskset_ea) {
+            s_ts_held = 0; ts_unlock(); return;
+        }
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
     if (done_task < 128) spu_taskset2_set_exit(taskset_ea, done_task, 1, 0);
@@ -1451,18 +1528,25 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * Ascension's particle work runs in two phases: the last of five tasks in one
  * taskset creates the next five in a sibling, and the main thread waits for
  * them. */
-#define SPU_TASKSETS_MAX 32
-static volatile uint32_t s_tasksets[SPU_TASKSETS_MAX];
-static volatile int s_n_tasksets;
-
 void spu_taskset_register(uint32_t ea)
 {
-    const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++) if (s_tasksets[i] == ea) return;
-    if (n < SPU_TASKSETS_MAX) {
-        s_tasksets[n] = ea;
-        __atomic_store_n(&s_n_tasksets, n + 1, __ATOMIC_RELEASE);
+    if (!ea) return;
+    if (!s_ts_held) ts_lock();
+    /* Abort leaves holes; search for an existing key before taking a hole. */
+    for (int i = 0; i < SPU_TASKSETS_MAX; i++)
+        if (__atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE) == ea) {
+            if (!s_ts_held) ts_unlock();
+            return;
+        }
+    for (int i = 0; i < SPU_TASKSETS_MAX; i++) {
+        uint32_t current = __atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE);
+        if (current == ea) break;
+        if (!current && i >= s_tasksets_hw)
+            __atomic_store_n(&s_tasksets_hw, i + 1, __ATOMIC_RELEASE);
+        if (!current && (__atomic_compare_exchange_n(&s_tasksets[i], &current, ea, 0,
+                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || current == ea)) break;
     }
+    if (!s_ts_held) ts_unlock();
 }
 
 void spu_taskset_line_committed(uint32_t line)
@@ -1470,9 +1554,11 @@ void spu_taskset_line_committed(uint32_t line)
     /* A commit to a taskset's first line (its bitsets) may have created a
      * task: start whatever is enabled, ready or pending, and not running. */
     {
-        const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
+        int n = __atomic_load_n(&s_tasksets_hw, __ATOMIC_ACQUIRE);
         for (int i = 0; i < n; i++)
-            if (s_tasksets[i] == line) { spu_taskset_start_pending(line); break; }
+            if (__atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE) == line) {
+                spu_taskset_start_pending(line); break;
+            }
     }
     /* Nothing parked -- the whole run, for a title that never parks a taskset
      * task -- costs one load instead of a 64-slot scan; otherwise only the

@@ -27,7 +27,11 @@ void spu_linelock_unlock(uint32_t ea) {(void)ea;}
 void spu_linelock_release(uint32_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)value;(void)width;}
 void spu_taskset2_register(uint32_t ea) {(void)ea;}
+int spu_taskset2_prepare(uint32_t ea) {(void)ea;return 1;}
+void spu_taskset2_commit(uint32_t ea) {(void)ea;}
+void spu_taskset2_abort(uint32_t ea) {(void)ea;}
 void spu_taskset_register(uint32_t ea) {(void)ea;}
+int64_t sys_event_flag_destroy_host(uint32_t id) {(void)id;return 0;}
 int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init) {
     vm_write32(id_out, 7u); (void)init; return 0; }
 static _Alignas(128) uint8_t memory[0x10000];
