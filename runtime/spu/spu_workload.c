@@ -547,17 +547,26 @@ void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t t)
      * it when a task exits; nothing here did, so a task that joins its workers
      * (Havok's master SPU task does) retried forever and the PPU waited on it.
      * Only Taskset2s have the array -- a v1 taskset ends at 0x1900. */
-static uint32_t s_ts2[16]; static int s_n_ts2;
+static uint32_t s_ts2[16];
 void spu_taskset2_register(uint32_t ea)
 {
-    for (int i = 0; i < s_n_ts2; i++) if (s_ts2[i] == ea) return;
-    if (s_n_ts2 < 16) s_ts2[s_n_ts2++] = ea;
+    if(!ea)return;
+    for(int i=0;i<16;i++) {
+        uint32_t current=__atomic_load_n(&s_ts2[i],__ATOMIC_ACQUIRE);
+        if(current==ea)return;
+        if(!current) {
+            if(__atomic_compare_exchange_n(&s_ts2[i],&current,ea,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE) || current==ea)return;
+        }
+    }
 }
-static int spu_taskset_is_v2(uint32_t ea)
+int spu_taskset2_is_registered(uint32_t ea)
 {
-    for (int i = 0; i < s_n_ts2; i++) if (s_ts2[i] == ea) return 1;
+    if(!ea)return 0;
+    for(int i=0;i<16;i++)if(__atomic_load_n(&s_ts2[i],__ATOMIC_ACQUIRE)==ea)return 1;
     return 0;
 }
+static int spu_taskset_is_v2(uint32_t ea)
+{ return spu_taskset2_is_registered(ea); }
 void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint32_t code)
 {
     extern uint8_t* vm_base;

@@ -1240,7 +1240,8 @@ static s32 spurs_create_task2_impl(u64 taskset_ea, u64 taskId_ea, u64 eaElf,
     free(ls);
     if (!valid) return CELL_SPURS_TASK_ERROR_INVAL;
     AcquireSRWLockExclusive(&s_task2_api_lock);
-    if (vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
+    if (!spu_taskset2_is_registered((u32)taskset_ea) ||
+        vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
         ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
     }
     u32 slot=spurs_taskset_take_slot((u32)taskset_ea,CELL_SPURS_MAX_TASK);
@@ -1332,7 +1333,8 @@ s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
     u32 rec=(u32)taskset_ea+TS2_EXITCODE+TS2_EXITCODE_STRIDE*taskId;
     for (;;) {
         AcquireSRWLockExclusive(&s_task2_api_lock);
-        if (vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
+        if (!spu_taskset2_is_registered((u32)taskset_ea) ||
+        vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
             ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
         }
         spu_linelock_lock(rec);

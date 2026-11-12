@@ -108,6 +108,8 @@ int main(void)
     vm_write32(ELF+0x34,1);vm_write32(ELF+0x38,0x80);
     vm_write32(ELF+0x3c,0x3000);vm_write32(ELF+0x44,16);vm_write32(ELF+0x48,16);
     vm_write64(BIN,ELF);
+    vm_write32(0x20000+CSTS_SIZE_FIELD,TS2_STRUCT_END);
+    assert(create(0x20000,OUT,BIN)==CELL_SPURS_TASK_ERROR_STAT);
     /* Missing lift: real dispatch failure must not publish an output id,
      * leave enabled/ready bits, or destroy the previous exit record. */
     u32 rec=TS+TS2_EXITCODE;vm_base[rec+15]=4;vm_write32(rec+8,0x12345678);
