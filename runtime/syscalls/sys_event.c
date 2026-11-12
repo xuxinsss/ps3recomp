@@ -28,18 +28,22 @@ sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 /* Table lock for allocation */
 #ifdef _WIN32
 static CRITICAL_SECTION s_evt_table_lock;
-static int              s_evt_table_lock_init = 0;
+static INIT_ONCE s_evt_table_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK evt_table_initialize(PINIT_ONCE once, PVOID parameter, PVOID* context)
+{
+    (void)once; (void)parameter; (void)context;
+    InitializeCriticalSection(&s_evt_table_lock);
+    return TRUE;
+}
 #else
 static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
+static uint32_t s_flag_generation;
 
 static void evt_table_lock(void)
 {
 #ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
+    InitOnceExecuteOnce(&s_evt_table_once, evt_table_initialize, NULL, NULL);
     EnterCriticalSection(&s_evt_table_lock);
 #else
     pthread_mutex_lock(&s_evt_table_lock);
@@ -1168,7 +1172,7 @@ int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern)
     return sys_event_flag_create(&c);
 }
 
-int64_t sys_event_flag_create(ppu_context* ctx)
+static int64_t event_flag_create(ppu_context* ctx, uint64_t* token)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
     uint32_t attr_addr   = LV2_ARG_PTR(ctx, 1);
@@ -1180,13 +1184,14 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     for (int i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
         if (!g_sys_event_flags[i].active) { slot = i; break; }
     }
-    if (slot < 0) {
+    if (slot < 0 || s_flag_generation == UINT32_MAX) {
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
     sys_event_flag_info* f = &g_sys_event_flags[slot];
     memset(f, 0, sizeof(*f));
+    f->generation = ++s_flag_generation;
     f->active  = 1;
     f->pattern = init_pattern;
 
@@ -1215,6 +1220,7 @@ int64_t sys_event_flag_create(ppu_context* ctx)
 #endif
 
     uint32_t flag_id = (uint32_t)(slot + 1);
+    if (token) *token = ((uint64_t)f->generation << 32) | flag_id;
     if (id_out_addr != 0) {
         write_be32(id_out_addr, flag_id);
     }
@@ -1225,6 +1231,48 @@ int64_t sys_event_flag_create(ppu_context* ctx)
 
     evt_table_unlock();
     return CELL_OK;
+}
+
+int64_t sys_event_flag_create(ppu_context* ctx)
+{ return event_flag_create(ctx, NULL); }
+
+int64_t sys_event_flag_create_owned(uint32_t id_out, uint64_t pattern, uint64_t* token)
+{
+    ppu_context c;
+    memset(&c, 0, sizeof c);
+    c.gpr[3] = id_out; c.gpr[5] = pattern;
+    *token = 0;
+    return event_flag_create(&c, token);
+}
+
+/* Leases exclude destruction/reallocation of the mutex and condition variable
+ * throughout an operation, including the time a waiter drops its flag lock. */
+static sys_event_flag_info* flag_acquire(uint32_t id)
+{
+    if (!id || id > SYS_EVENT_FLAG_MAX) return NULL;
+    evt_table_lock();
+    sys_event_flag_info* f = &g_sys_event_flags[id - 1];
+    if (f->active) __atomic_fetch_add(&f->users, 1, __ATOMIC_RELAXED);
+    else f = NULL;
+    evt_table_unlock();
+    return f;
+}
+static void flag_release(sys_event_flag_info* f)
+{
+    evt_table_lock();
+    __atomic_fetch_sub(&f->users, 1, __ATOMIC_RELAXED);
+    evt_table_unlock();
+}
+/* Table lock held; caller has checked users == 0. */
+static void flag_retire(sys_event_flag_info* f)
+{
+#ifdef _WIN32
+    DeleteCriticalSection(&f->lock);
+#else
+    pthread_cond_destroy(&f->cv);
+    pthread_mutex_destroy(&f->lock);
+#endif
+    f->active = 0;
 }
 
 int64_t sys_event_flag_destroy(ppu_context* ctx)
@@ -1242,14 +1290,10 @@ int64_t sys_event_flag_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-#ifdef _WIN32
-    DeleteCriticalSection(&f->lock);
-#else
-    pthread_cond_destroy(&f->cv);
-    pthread_mutex_destroy(&f->lock);
-#endif
-
-    f->active = 0;
+    if (__atomic_load_n(&f->users, __ATOMIC_RELAXED)) {
+        evt_table_unlock(); return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    flag_retire(f);
     evt_table_unlock();
     return CELL_OK;
 }
@@ -1261,6 +1305,27 @@ int64_t sys_event_flag_destroy_host(uint32_t flag_id)
     memset(&c, 0, sizeof c);
     c.gpr[3] = flag_id;
     return sys_event_flag_destroy(&c);
+}
+
+int64_t sys_event_flag_destroy_owned_pair(uint64_t first, uint64_t second)
+{
+    uint64_t tokens[2] = { first, second };
+    sys_event_flag_info* owned[2] = { NULL, NULL };
+    evt_table_lock();
+    for (int i = 0; i < 2; i++) {
+        uint32_t id = (uint32_t)tokens[i], generation = (uint32_t)(tokens[i] >> 32);
+        if (!id || id > SYS_EVENT_FLAG_MAX || !generation) continue;
+        sys_event_flag_info* f = &g_sys_event_flags[id - 1];
+        if (!f->active || f->generation != generation) continue;
+        if (__atomic_load_n(&f->users, __ATOMIC_RELAXED)) {
+            evt_table_unlock(); return (int64_t)(int32_t)CELL_EBUSY;
+        }
+        owned[i] = f;
+    }
+    if (owned[0]) flag_retire(owned[0]);
+    if (owned[1] && owned[1] != owned[0]) flag_retire(owned[1]);
+    evt_table_unlock();
+    return CELL_OK;
 }
 
 /* Check if wait condition is met */
@@ -1317,23 +1382,23 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    sys_event_flag_info* f = flag_acquire(flag_id);
     /* PS3_EVF_OK_IF_MISSING (diagnostic, env-gated): the game busy-spins ~145k times on
      * event_flag_wait(flag=100 bits=0x2) with a GARBAGE mode (0x38CAE4) on a
      * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
      * (as if the flag were set) breaks the spin and lets the game progress into
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
     { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
-      if (s_f && !g_sys_event_flags[flag_id-1].active) {
+      if (s_f && !f) {
         static int _n=0; if(PS3_LOG_FIRST(_n, 4)) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
         return CELL_OK;
       } }
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active) {
+    if (!f) {
         { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) {
             uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
             fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
-            /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
+            /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29) and *(r29+0x24)) */
             if (r29 && r29 < 0x10000000u) { uint8_t* p=(uint8_t*)vm_to_host(r29);
               fprintf(stderr,"     [r29+0x00..0x30]:"); for(int i=0;i<0x34;i+=4) fprintf(stderr," %02X%02X%02X%02X",p[i],p[i+1],p[i+2],p[i+3]); fprintf(stderr,"\n"); }
         } }
@@ -1351,10 +1416,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    { static int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
-
-    if (bitpat == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    { static int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)bitpat); }
 
     /* PS3_EVF_FORCE (diagnostic): the game's init blocks polling event_flag
      * (flag=100 bits=0x2) for a subsystem/SPU completion that our HLE never fires,
@@ -1362,7 +1424,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * bits) to see if the game advances into its real render/content code. Blunt;
      * identifies the gate. */
     { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
-      if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
+      if (s_fe) {
         static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
                     flag_id, (unsigned long long)bitpat, mode);
@@ -1395,6 +1457,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                     *out = bswap64(f->pattern);
                 }
                 LeaveCriticalSection(&f->lock);
+                flag_release(f);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
             LeaveCriticalSection(&f->lock);
@@ -1412,6 +1475,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                         *out = bswap64(f->pattern);
                     }
                     LeaveCriticalSection(&f->lock);
+                    flag_release(f);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
             }
@@ -1457,6 +1521,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
                     *out = bswap64(f->pattern);
                 }
                 pthread_mutex_unlock(&f->lock);
+                flag_release(f);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
@@ -1478,6 +1543,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     pthread_mutex_unlock(&f->lock);
 #endif
 
+    flag_release(f);
     return CELL_OK;
 }
 
@@ -1491,8 +1557,8 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
+    sys_event_flag_info* f = flag_acquire(flag_id);
+    if (!f)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
@@ -1511,6 +1577,7 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
 #else
         pthread_mutex_unlock(&f->lock);
 #endif
+        flag_release(f);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
 
@@ -1533,6 +1600,7 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
     pthread_mutex_unlock(&f->lock);
 #endif
 
+    flag_release(f);
     return CELL_OK;
 }
 
@@ -1547,8 +1615,8 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
+    sys_event_flag_info* f = flag_acquire(flag_id);
+    if (!f)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
@@ -1563,6 +1631,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     pthread_mutex_unlock(&f->lock);
 #endif
 
+    flag_release(f);
     return CELL_OK;
 }
 
@@ -1574,8 +1643,8 @@ int64_t sys_event_flag_set(ppu_context* ctx)
 void ydkj_wake_all_event_flags(void)
 {
     for (int i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
-        sys_event_flag_info* f = &g_sys_event_flags[i];
-        if (!f->active) continue;
+        sys_event_flag_info* f = flag_acquire((uint32_t)i + 1);
+        if (!f) continue;
 #ifdef _WIN32
         EnterCriticalSection(&f->lock);
         f->pattern |= 0xFFFFFFFFFFFFFFFFull;
@@ -1587,6 +1656,7 @@ void ydkj_wake_all_event_flags(void)
         pthread_cond_broadcast(&f->cv);
         pthread_mutex_unlock(&f->lock);
 #endif
+        flag_release(f);
     }
 }
 
@@ -1598,8 +1668,8 @@ int64_t sys_event_flag_clear(ppu_context* ctx)
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
+    sys_event_flag_info* f = flag_acquire(flag_id);
+    if (!f)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
@@ -1612,6 +1682,7 @@ int64_t sys_event_flag_clear(ppu_context* ctx)
     pthread_mutex_unlock(&f->lock);
 #endif
 
+    flag_release(f);
     return CELL_OK;
 }
 
@@ -1623,8 +1694,8 @@ int64_t sys_event_flag_get(ppu_context* ctx)
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
+    sys_event_flag_info* f = flag_acquire(flag_id);
+    if (!f)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     uint64_t pattern;
@@ -1643,6 +1714,7 @@ int64_t sys_event_flag_get(ppu_context* ctx)
         *out = bswap64(pattern);
     }
 
+    flag_release(f);
     return CELL_OK;
 }
 
@@ -1654,13 +1726,6 @@ void sys_event_init(lv2_syscall_table* tbl)
     memset(g_sys_event_queues, 0, sizeof(g_sys_event_queues));
     memset(g_sys_event_ports,  0, sizeof(g_sys_event_ports));
     memset(g_sys_event_flags,  0, sizeof(g_sys_event_flags));
-
-#ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
-#endif
 
     /* Event queues */
     lv2_syscall_register(tbl, SYS_EVENT_QUEUE_CREATE,      sys_event_queue_create);

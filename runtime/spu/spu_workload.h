@@ -159,7 +159,15 @@ int spu_taskset2_is_registered(uint32_t ea);
  * Only unpublished reservations can be aborted. No live teardown is implied. */
 int spu_taskset2_prepare(uint32_t ea);
 void spu_taskset2_commit(uint32_t ea);
+void spu_taskset2_commit_flags(uint32_t ea, uint64_t first, uint64_t second);
 void spu_taskset2_abort(uint32_t ea);
+uint64_t spu_taskset2_acquire(uint32_t ea);
+void spu_taskset2_release(uint32_t ea, uint64_t generation);
+/* API transaction lock held by caller. 1 = closed/quiescent, 0 = busy,
+ * -1 = absent. No line lock is carried into event-flag retirement. */
+int spu_taskset2_retire_begin(uint32_t ea, uint64_t flags[2]);
+void spu_taskset2_retire_cancel(uint32_t ea);
+void spu_taskset2_retire_finish(uint32_t ea);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);

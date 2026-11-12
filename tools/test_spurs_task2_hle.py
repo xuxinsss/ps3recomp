@@ -12,6 +12,10 @@ with tempfile.TemporaryDirectory(prefix='task2-hle-') as tmp:
            'spurs_policy_blob_weak','spu_interp']
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',
         '-ffunction-sections','-fdata-sections',
+        '-DSPU_TASKSET_TAIL_OBSERVER=fixture_task2_tail',
+        '-DSPU_TASKSET_LS_ALLOC=fixture_task2_ls_alloc',
+        '-DSPU_TASKSET_LS_FREE=fixture_task2_ls_free',
+        '-DSPU_TASKSET_THREAD_CREATE=fixture_task2_thread_create',
         '-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections',
         '-I'+str(r/'include'),'-I'+str(r/'runtime/spu'),'-I'+str(r/'runtime/platform'),
         str(r/'tests/test_spurs_task2_hle.c'),
@@ -19,5 +23,6 @@ with tempfile.TemporaryDirectory(prefix='task2-hle-') as tmp:
         str(r/'libs/spurs/spurs_taskset.c'),
         str(r/'runtime/syscalls/sys_event.c'),
         str(r/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
-    subprocess.run([str(out)],check=True,timeout=30)
+    env=dict(os.environ,LBP_PERSIST_LS='1')
+    subprocess.run([str(out)],check=True,timeout=45,env=env)
     subprocess.run([str(out),'--directory-full'],check=True,timeout=30)

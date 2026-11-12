@@ -1135,16 +1135,15 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 att
                                  SPURS_TASKSET2_SIZE, 0);
     /* These flags are private to an unpublished object. On a partial failure
      * no task can have acquired them, so destroying the first one is safe. */
-    extern int64_t sys_event_flag_create_host(uint32_t, uint64_t);
-    extern int64_t sys_event_flag_destroy_host(uint32_t);
-    u32 first_flag = 0;
+    extern int64_t sys_event_flag_create_owned(uint32_t, uint64_t, uint64_t*);
+    extern int64_t sys_event_flag_destroy_owned_pair(uint64_t, uint64_t);
+    uint64_t flags[2] = {0, 0};
     if (rc == CELL_OK) {
-        if (sys_event_flag_create_host((u32)ts + CSTS_EVENT_FLAG_ID1, 0) != CELL_OK)
+        if (sys_event_flag_create_owned((u32)ts + CSTS_EVENT_FLAG_ID1, 0, &flags[0]) != CELL_OK)
             rc = CELL_SPURS_TASK_ERROR_NOMEM;
         else {
-            first_flag = vm_read32((u32)ts + CSTS_EVENT_FLAG_ID1);
-            if (sys_event_flag_create_host((u32)ts + CSTS_EVENT_FLAG_ID2, 0) != CELL_OK) {
-                sys_event_flag_destroy_host(first_flag);
+            if (sys_event_flag_create_owned((u32)ts + CSTS_EVENT_FLAG_ID2, 0, &flags[1]) != CELL_OK) {
+                sys_event_flag_destroy_owned_pair(flags[0], 0);
                 rc = CELL_SPURS_TASK_ERROR_NOMEM;
             }
         }
@@ -1152,7 +1151,7 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 att
     if (rc == CELL_OK) {
         g_ydkj_real_taskset_ea = (u32)ts;
         g_ydkj_real_spurs_ea = (u32)owner;
-        spu_taskset2_commit((u32)ts);
+        spu_taskset2_commit_flags((u32)ts, flags[0], flags[1]);
     } else {
         memcpy(vm_base + (u32)ts, saved, SPURS_TASKSET2_SIZE);
         spu_taskset2_abort((u32)ts);
@@ -1363,12 +1362,19 @@ s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
     if ((taskset_ea&127u)||(exitCode_ea&3u)) return CELL_SPURS_TASK_ERROR_ALIGN;
     if (!task2_range(taskset_ea,TS2_STRUCT_END) ||
         (exitCode_ea && !task2_range(exitCode_ea,4))) return CELL_SPURS_TASK_ERROR_FAULT;
+    AcquireSRWLockExclusive(&s_task2_api_lock);
+    u64 generation = 0;
+    if (vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)==TS2_STRUCT_END)
+        generation = spu_taskset2_acquire((u32)taskset_ea);
+    ReleaseSRWLockExclusive(&s_task2_api_lock);
+    if (!generation) return CELL_SPURS_TASK_ERROR_STAT;
+    s32 result = CELL_OK;
     u32 rec=(u32)taskset_ea+TS2_EXITCODE+TS2_EXITCODE_STRIDE*taskId;
     for (;;) {
         AcquireSRWLockExclusive(&s_task2_api_lock);
         if (!spu_taskset2_is_registered((u32)taskset_ea) ||
         vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
-            ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
+            ReleaseSRWLockExclusive(&s_task2_api_lock);result=CELL_SPURS_TASK_ERROR_STAT;break;
         }
         spu_linelock_lock(rec);
         u8* e=vm_base+rec;
@@ -1387,22 +1393,27 @@ s32 cellSpursJoinTask2(u64 taskset_ea, u32 taskId, u64 exitCode_ea)
             spu_linelock_unlock(enabled);
         }
         ReleaseSRWLockExclusive(&s_task2_api_lock);
-        if (invalid) return CELL_SPURS_TASK_ERROR_SRCH;
+        if (invalid) { result=CELL_SPURS_TASK_ERROR_SRCH;break; }
         if (!live) {
             spu_linelock_lock(rec);
             u8 latest=vm_base[rec+15]&15u;
             spu_linelock_unlock(rec);
             if(latest==TS2_ST_EXITED || latest==TS2_ST_JOINED)continue;
-            return CELL_SPURS_TASK_ERROR_SRCH;
+            result=CELL_SPURS_TASK_ERROR_SRCH;break;
         }
         /* Preserve the local support patch's cached rejoin behavior pending a
          * firmware trace; do not claim this is a general SDK contract. */
         if (state==TS2_ST_EXITED || state==TS2_ST_JOINED) {
             if(exitCode_ea) vm_write32((u32)exitCode_ea,code);
-            return CELL_OK;
+            break;
         }
+#ifdef SPURS_TASK2_JOIN_WAIT_OBSERVER
+        SPURS_TASK2_JOIN_WAIT_OBSERVER((u32)taskset_ea, generation);
+#endif
         Sleep(5);
     }
+    spu_taskset2_release((u32)taskset_ea,generation);
+    return result;
 }
 
 s32 cellSpursDestroyTaskset2(u64 taskset_ea)
@@ -1415,16 +1426,27 @@ s32 cellSpursDestroyTaskset2(u64 taskset_ea)
         vm_read32((u32)taskset_ea+CSTS_SIZE_FIELD)!=TS2_STRUCT_END) {
         ReleaseSRWLockExclusive(&s_task2_api_lock);return CELL_SPURS_TASK_ERROR_STAT;
     }
-    spu_linelock_lock((u32)taskset_ea);
-    int busy=0;
-    for(u32 i=0;i<16;i++) busy|=vm_base[(u32)taskset_ea+CSTS_ENABLED+i] |
-        vm_base[(u32)taskset_ea+CSTS_RUNNING+i] | vm_base[(u32)taskset_ea+CSTS_READY+i] |
-        vm_base[(u32)taskset_ea+CSTS_PENDING_READY+i];
-    spu_linelock_unlock((u32)taskset_ea);
+    u64 flags[2];
+    int retired=spu_taskset2_retire_begin((u32)taskset_ea,flags);
+    if (retired != 1) {
+        ReleaseSRWLockExclusive(&s_task2_api_lock);
+        return retired < 0 ? CELL_SPURS_TASK_ERROR_STAT : CELL_SPURS_TASK_ERROR_BUSY;
+    }
+    extern int64_t sys_event_flag_destroy_owned_pair(uint64_t,uint64_t);
+    if (sys_event_flag_destroy_owned_pair(flags[0],flags[1]) != CELL_OK) {
+        spu_taskset2_retire_cancel((u32)taskset_ea);
+        ReleaseSRWLockExclusive(&s_task2_api_lock);
+        return CELL_SPURS_TASK_ERROR_BUSY;
+    }
+    vm_write32((u32)taskset_ea+CSTS_EVENT_FLAG_ID1,0);
+    vm_write32((u32)taskset_ea+CSTS_EVENT_FLAG_ID2,0);
+    vm_write32((u32)taskset_ea+CSTS_SIZE_FIELD,0);
+    spu_taskset2_retire_finish((u32)taskset_ea);
+    if (g_ydkj_real_taskset_ea==(u32)taskset_ea) {
+        g_ydkj_real_taskset_ea=0; g_ydkj_real_taskid=0;
+    }
     ReleaseSRWLockExclusive(&s_task2_api_lock);
-    /* Real shutdown must retire host registrations and lv2 event flags.
-     * Until that lifecycle is implemented, never report a fictitious teardown. */
-    return busy ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_NOSYS;
+    return CELL_OK;
 }
 
 /* =========================================================================

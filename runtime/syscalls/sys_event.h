@@ -115,6 +115,8 @@ extern sys_event_port_info g_sys_event_ports[SYS_EVENT_PORT_MAX];
 
 typedef struct sys_event_flag_info {
     int      active;
+    uint32_t generation; /* allocation identity, table-lock protected */
+    unsigned users;      /* host leases; atomic diagnostic reads allowed */
     uint32_t protocol;
     uint32_t type;       /* single / multi waiter */
     char     name[8];
@@ -153,6 +155,10 @@ int64_t sys_event_flag_create(ppu_context* ctx);
 int64_t sys_event_flag_destroy(ppu_context* ctx);
 int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern);
 int64_t sys_event_flag_destroy_host(uint32_t flag_id);
+int64_t sys_event_flag_create_owned(uint32_t id_out, uint64_t pattern, uint64_t* token);
+/* Atomically retire the still-owned members of a pair. Reused IDs are ignored;
+ * an in-flight operation/waiter returns EBUSY without retiring either member. */
+int64_t sys_event_flag_destroy_owned_pair(uint64_t first, uint64_t second);
 int64_t sys_event_flag_wait(ppu_context* ctx);
 int64_t sys_event_flag_trywait(ppu_context* ctx);
 int64_t sys_event_flag_set(ppu_context* ctx);

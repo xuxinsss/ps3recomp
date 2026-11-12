@@ -29,11 +29,15 @@ void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)
 void spu_taskset2_register(uint32_t ea) {(void)ea;}
 int spu_taskset2_prepare(uint32_t ea) {(void)ea;return 1;}
 void spu_taskset2_commit(uint32_t ea) {(void)ea;}
+void spu_taskset2_commit_flags(uint32_t ea,uint64_t a,uint64_t b) {(void)ea;(void)a;(void)b;}
 void spu_taskset2_abort(uint32_t ea) {(void)ea;}
 void spu_taskset_register(uint32_t ea) {(void)ea;}
 int64_t sys_event_flag_destroy_host(uint32_t id) {(void)id;return 0;}
 int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init) {
     vm_write32(id_out, 7u); (void)init; return 0; }
+int64_t sys_event_flag_create_owned(uint32_t ea,uint64_t pattern,uint64_t* token) {
+    *token=7;return sys_event_flag_create_host(ea,pattern); }
+int64_t sys_event_flag_destroy_owned_pair(uint64_t a,uint64_t b) {(void)a;(void)b;return 0;}
 static _Alignas(128) uint8_t memory[0x10000];
 #define PTR(type, ea) ((type*)(uintptr_t)(ea))
 static void expect(int ok, const char* what) {

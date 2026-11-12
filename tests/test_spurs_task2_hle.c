@@ -1,3 +1,6 @@
+#include <stdint.h>
+void fixture_task2_join_wait(uint32_t,uint64_t);
+#define SPURS_TASK2_JOIN_WAIT_OBSERVER fixture_task2_join_wait
 #define spu_linelock_lock fixture_task2_line_lock
 #define spu_workload_dispatch_task fixture_dispatch_task
 #include "../libs/spurs/cellSpurs.c"
@@ -26,7 +29,38 @@ void spu_thread_publish_ctx(uint32_t tid,void* c){(void)tid;(void)c;}
 
 int spu_workload_dispatch_task(const uint8_t*,uint32_t,uint32_t,uint32_t,uint32_t);
 void spu_linelock_lock(uint32_t);
+void spu_taskset2_set_exit(uint32_t,uint32_t,int,uint32_t);
+void spu_taskset_start_pending(uint32_t);
 static atomic_uint watched_record,join_arrived,join_done;
+static atomic_uint tail_target,tail_arrived,tail_go,join_wait_target,join_wait_arrived,join_wait_go;
+static atomic_ullong tail_generation;
+static atomic_uint fail_ls,fail_thread;
+static atomic_uint live_ls;
+void* fixture_task2_ls_alloc(size_t n,size_t size)
+{
+    if(atomic_load(&fail_ls))return NULL;
+    void* p=calloc(n,size);if(p)atomic_fetch_add(&live_ls,1);return p;
+}
+void fixture_task2_ls_free(void* p)
+{ if(p) { assert(atomic_fetch_sub(&live_ls,1)>0);free(p); } }
+int fixture_task2_thread_create(pthread_t* t,const pthread_attr_t* attr,void* (*fn)(void*),void* arg)
+{ return atomic_load(&fail_thread) ? EAGAIN : pthread_create(t,attr,fn,arg); }
+void fixture_task2_tail(uint32_t ea,uint64_t generation)
+{
+    if(ea && ea==atomic_load(&tail_target)) {
+        atomic_store(&tail_generation,generation);atomic_store(&tail_arrived,1);
+        while(!atomic_load(&tail_go))Sleep(1);
+    }
+}
+void fixture_task2_join_wait(uint32_t ea,uint64_t generation)
+{
+    (void)generation;
+    if(ea && ea==atomic_load(&join_wait_target)) {
+        atomic_store(&join_wait_arrived,1);
+        while(!atomic_load(&join_wait_go))Sleep(1);
+    }
+}
+void ppu_thread_note_block(uint64_t tid){(void)tid;}
 void fixture_task2_line_lock(uint32_t ea)
 {
     if(ea==atomic_load(&watched_record))atomic_store(&join_arrived,1);
@@ -53,7 +87,20 @@ static void init_ts(u32 ea)
     extern void spu_taskset2_register(uint32_t);
     spu_taskset2_register(ea);
 }
-static void manufactured_task(spu_context* c){(void)c;}
+static atomic_uint check_fresh_ls;
+static atomic_uint entry_taskset;
+static void manufactured_task(spu_context* c)
+{
+    u32 ts=atomic_load(&entry_taskset);
+    if(ts) {
+        spurs_taskset_bitset_update(ts+CSTS_RUNNING,0,1);
+        spurs_taskset_bitset_update(ts+CSTS_SIGNALLED,0,1);
+        spurs_taskset_bitset_update(ts+CSTS_WAITING,0,1);
+    }
+    if(atomic_load(&check_fresh_ls)) {
+        assert(c->ls[0x3fff0]==0);c->ls[0x3fff0]=0xa5;
+    }
+}
 static s32 create(u64 ts,u64 out,u64 bin)
 { return cellSpursCreateTask2WithBinInfo(ts,out,bin,0,0); }
 static void unchanged_failure(s32 expected,u64 ts,u64 out,u64 bin)
@@ -181,6 +228,157 @@ static void taskset_creation_failures(void)
     assert_failed_taskset(0x68000);
     puts("Taskset2 allocation rollback and bounded registration: PASS");
 }
+
+static void wait_for(atomic_uint* flag)
+{
+    for(unsigned i=0;i<3000&&!atomic_load(flag);i++)Sleep(1);
+    assert(atomic_load(flag));
+}
+static void destroy_quiet(u32 ea)
+{
+    for(unsigned i=0;i<3000;i++) {
+        s32 rc=cellSpursDestroyTaskset2(ea);
+        if(rc==0)return;
+        assert(rc==CELL_SPURS_TASK_ERROR_BUSY);Sleep(1);
+    }
+    assert(!"taskset failed to quiesce");
+}
+static atomic_int old_join_result;
+static void* sleeping_join(void* unused)
+{
+    (void)unused;atomic_store(&old_join_result,cellSpursJoinTask2(TS,3,CODE));return NULL;
+}
+static int64_t flag_wait_result;
+static void* flag_waiter(void* arg)
+{
+    ppu_context ctx={0};ctx.gpr[3]=*(u32*)arg;ctx.gpr[4]=1;
+    ctx.gpr[5]=SYS_EVENT_FLAG_WAIT_OR;ctx.gpr[7]=3000000;
+    flag_wait_result=sys_event_flag_wait(&ctx);return NULL;
+}
+static void lifecycle(void)
+{
+    const u32 existing[]={TS,TS_B,0x20000,0x28000,0x48000,0x50000,0x58000,0x60000};
+    for(unsigned i=0;i<8;i++)destroy_quiet(existing[i]);
+    assert(active_flags()==0 && !atomic_load(&live_ls));
+    atomic_store(&check_fresh_ls,1);
+    /* Force the gap between guest exit and the very last host cleanup. */
+    assert(create_taskset(TS)==0);
+    extern void spu_taskset_latch_wake(uint32_t);
+    extern int spu_taskset_consume_wake(uint32_t);
+    spu_taskset_latch_wake(TS);
+    atomic_store(&tail_target,TS);
+    atomic_store(&entry_taskset,TS);
+    assert(create(TS,OUT,BIN)==0);
+    assert(cellSpursJoinTask2(TS,vm_read32(OUT),CODE)==0);wait_for(&tail_arrived);
+    for(unsigned i=0;i<0x60;i++)assert(vm_base[TS+i]==0);
+    atomic_store(&entry_taskset,0);
+    assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_BUSY);
+    assert(create_taskset(TS)==CELL_SPURS_TASK_ERROR_BUSY);
+    u64 old_generation=atomic_load(&tail_generation);assert(old_generation);
+    atomic_store(&tail_go,1);destroy_quiet(TS);atomic_store(&tail_target,0);
+    assert(!spu_taskset2_is_registered(TS) && vm_read32(TS+CSTS_SIZE_FIELD)==0);
+    assert(active_flags()==0);
+    memset(vm_base+TS,0xa5,TS2_STRUCT_END);
+    spu_taskset2_set_exit(TS,0,1,0xdeadbeef);
+    spu_taskset_start_pending(TS);
+    spu_taskset_signal_task(TS,0);
+    spu_taskset_latch_wake(TS);
+    assert(!spu_workload_dispatch_task(vm_base+ELF,0x90,0,TS,0));
+    g_ydkj_real_taskset_ea=TS;
+    assert(!spu_workload_dispatch_async(vm_base+ELF,0x90,0));
+    for(unsigned i=0;i<TS2_STRUCT_END;i++)assert(vm_base[TS+i]==0xa5);
+    assert(create_taskset(TS)==0);
+    assert(!spu_taskset_consume_wake(TS));
+    u64 current_generation=spu_taskset2_acquire(TS);assert(current_generation>old_generation);
+    spu_taskset2_release(TS,old_generation); /* must not release the new lease */
+    assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_BUSY);
+    spu_taskset2_release(TS,current_generation);destroy_quiet(TS);
+    /* A sleeping Join pins its original generation, even after all guest
+     * eligibility bits have been removed. It cannot attach to a new object. */
+    assert(create_taskset(TS)==0);
+    spurs_taskset_bitset_update(TS+CSTS_ENABLED,3,1);
+    atomic_store(&join_wait_target,TS);
+    pthread_t waiter;assert(pthread_create(&waiter,NULL,sleeping_join,NULL)==0);
+    wait_for(&join_wait_arrived);
+    spurs_taskset_bitset_update(TS+CSTS_ENABLED,3,0);
+    assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_BUSY);
+    atomic_store(&join_wait_go,1);pthread_join(waiter,NULL);
+    assert(atomic_load(&old_join_result)==CELL_SPURS_TASK_ERROR_SRCH);
+    atomic_store(&join_wait_target,0);destroy_quiet(TS);
+    assert(create_taskset(TS)==0);
+    assert(cellSpursJoinTask2(TS,3,CODE)==CELL_SPURS_TASK_ERROR_SRCH);
+    /* Closing rejects both an explicit dispatch and an exit publisher. */
+    u64 flags[2];assert(spu_taskset2_retire_begin(TS,flags)==1);
+    assert(!spu_workload_dispatch_task(vm_base+ELF,0x90,0,TS,0));
+    spu_taskset2_set_exit(TS,0,1,0xdeadbeef);
+    assert(vm_base[TS+TS2_EXITCODE+15]==0);
+    spu_taskset_start_pending(TS);
+    spu_taskset2_retire_cancel(TS);destroy_quiet(TS);
+    /* A real lv2 waiter keeps BOTH flags and the taskset alive. */
+    assert(create_taskset(TS)==0);
+    u32 first=vm_read32(TS+CSTS_EVENT_FLAG_ID1),second=vm_read32(TS+CSTS_EVENT_FLAG_ID2);
+    assert(pthread_create(&waiter,NULL,flag_waiter,&second)==0);
+    for(unsigned i=0;i<3000&&!__atomic_load_n(&g_sys_event_flags[second-1].users,__ATOMIC_RELAXED);i++)Sleep(1);
+    assert(__atomic_load_n(&g_sys_event_flags[second-1].users,__ATOMIC_RELAXED));
+    assert((s32)sys_event_flag_destroy_host(second)==(s32)CELL_EBUSY);
+    assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_BUSY);
+    assert(spu_taskset2_is_registered(TS) && active_flags()==2);
+    assert(g_sys_event_flags[first-1].active && g_sys_event_flags[second-1].active);
+    ppu_context ctx={0};ctx.gpr[3]=second;ctx.gpr[4]=1;assert(sys_event_flag_set(&ctx)==0);
+    pthread_join(waiter,NULL);assert(flag_wait_result==0);destroy_quiet(TS);
+    /* Guest ID corruption cannot transfer host ownership to another flag. */
+    assert(create_taskset(TS)==0);assert(sys_event_flag_create_host(OUT,0)==0);
+    u32 foreign=vm_read32(OUT);
+    vm_write32(TS+CSTS_EVENT_FLAG_ID1,foreign);vm_write32(TS+CSTS_EVENT_FLAG_ID2,foreign);
+    destroy_quiet(TS);assert(active_flags()==1 && g_sys_event_flags[foreign-1].active);
+    assert(sys_event_flag_destroy_host(foreign)==0);
+    /* An externally destroyed ID may now belong to a different allocation. */
+    assert(create_taskset(TS)==0);first=vm_read32(TS+CSTS_EVENT_FLAG_ID1);
+    assert(sys_event_flag_destroy_host(first)==0);
+    assert(sys_event_flag_create_host(OUT,0)==0 && vm_read32(OUT)==first);
+    destroy_quiet(TS);assert(active_flags()==1 && g_sys_event_flags[first-1].active);
+    assert(sys_event_flag_destroy_host(first)==0);
+    /* Failure before and after host-thread admission must leave no lease or
+     * eligible task that makes subsequent Destroy permanently busy. */
+    assert(create_taskset(TS)==0);
+    atomic_store(&fail_thread,1);
+    assert(create(TS,OUT,BIN)==CELL_SPURS_TASK_ERROR_NOMEM);
+    atomic_store(&fail_thread,0);destroy_quiet(TS);
+    assert(create_taskset(TS)==0);
+    atomic_store(&fail_ls,1);
+    assert(create(TS,OUT,BIN)==0);
+    assert(cellSpursJoinTask2(TS,vm_read32(OUT),CODE)==0);
+    assert(vm_read32(CODE)==UINT32_MAX);
+    atomic_store(&fail_ls,0);destroy_quiet(TS);
+    assert(create_taskset(TS)==0);
+    const u32 zero[4]={0};
+    spurs_taskset_add_task(TS,0,ELF,0,zero,zero);
+    atomic_store(&fail_thread,1);spu_taskset_start_pending(TS);
+    assert(vm_base[TS+CSTS_PENDING_READY]&0x80);
+    atomic_store(&fail_thread,0);spu_taskset_start_pending(TS);
+    assert(cellSpursJoinTask2(TS,0,CODE)==0);destroy_quiet(TS);
+    assert(create_taskset(TS)==0);first=vm_read32(TS+CSTS_EVENT_FLAG_ID1);
+    memset(&ctx,0,sizeof ctx);ctx.gpr[3]=first;ctx.gpr[4]=1;ctx.gpr[5]=SYS_EVENT_FLAG_WAIT_OR;
+    assert((s32)sys_event_flag_trywait(&ctx)==(s32)CELL_EBUSY);
+    ctx.gpr[4]=0;
+    assert(sys_event_flag_get(&ctx)==0);
+    ctx.gpr[4]=0;assert(sys_event_flag_clear(&ctx)==0);
+    ctx.gpr[4]=1;ctx.gpr[7]=1000;
+    assert((s32)sys_event_flag_wait(&ctx)==(s32)CELL_ETIMEDOUT);
+    assert(!__atomic_load_n(&g_sys_event_flags[first-1].users,__ATOMIC_RELAXED));
+    destroy_quiet(TS);
+    /* Exceed every original host directory/cache capacity without increasing
+     * any limit. Each generation must see fresh persistent local store. */
+    for(unsigned i=0;i<80;i++) {
+        u32 ea=existing[i%8];assert(create_taskset(ea)==0);
+        assert(create(ea,OUT,BIN)==0);
+        assert(cellSpursJoinTask2(ea,vm_read32(OUT),CODE)==0);
+        assert(vm_read32(CODE)==0);destroy_quiet(ea);
+        assert(active_flags()==0 && !spu_taskset2_is_registered(ea));
+        assert(!atomic_load(&live_ls));
+    }
+    puts("Taskset2 Destroy lifecycle, generation isolation and owned flags: PASS");
+}
 int main(int argc,char** argv)
 {
     (void)argv;
@@ -268,9 +466,10 @@ int main(int argc,char** argv)
     spurs_taskset_bitset_update(TS+CSTS_ENABLED,5,1);
     assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_BUSY);
     spurs_taskset_bitset_update(TS+CSTS_ENABLED,5,0);
-    assert(cellSpursDestroyTaskset2(TS)==CELL_SPURS_TASK_ERROR_NOSYS);
+    destroy_quiet(TS);init_ts(TS);
     assert(dispatch_calls>=4);
     unpublished_taskset();
     taskset_creation_failures();
+    lifecycle();
     puts("Task2 HLE safety and explicit dispatch: PASS");return 0;
 }

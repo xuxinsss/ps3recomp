@@ -295,6 +295,9 @@ static void test_unmatched_remove_keeps_bookkeeping(void)
 
 int main(void)
 {
+    extern void spu_taskset_register(uint32_t);
+    spu_taskset_register(TASKSET_A);
+    spu_taskset_register(TASKSET_B);
     printf("SPURS task wake on an SPU-side signal\n");
     spu_context_init(&g_spu, 0);   /* points ls at its own store */
     test_putllc_signal_wakes();
