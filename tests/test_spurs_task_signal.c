@@ -84,6 +84,11 @@ int main(void)
 {
     unsetenv("LBP_WS_DRAIN"); unsetenv("LBP_SPU_SERIAL");
     vm_base=calloc(1,ppu_vm_size); assert(vm_base);
+    /* Match real HLE management: host signals target a registered owner.
+     * Retirement now rejects unknown tasksets instead of writing stale EAs. */
+    extern void spu_taskset_register(uint32_t);
+    spu_taskset_register(0x1000);
+    spu_taskset_register(0x11000);
     /* Pre-arm as real taskset/SPU management already does: isolate the host
      * notification gap from first-publication races in the store fast path. */
     spu_lockline_lock(); spu_coh_reserve(NULL,0x1000); spu_lockline_unlock();

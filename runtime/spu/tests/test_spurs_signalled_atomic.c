@@ -138,6 +138,8 @@ static void interleave(void* (*host_op)(void*), uint32_t spu_bit)
 
 int main(void)
 {
+    extern void spu_taskset_register(uint32_t);
+    spu_taskset_register(TASKSET);
     /* A peer SPU has the bitset line reserved, as a task in GETLLAR does. */
     spu_lockline_lock();
     spu_coh_reserve(&g_peer, SIG_WORD);
