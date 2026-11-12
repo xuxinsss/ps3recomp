@@ -64,8 +64,19 @@ static uint8_t g_guest_mem[1u << 20];
 uint8_t* vm_base = g_guest_mem;
 uint32_t ppu_vm_size = 0;
 
+/* Observe arrival at the real data lock without replacing its arbitration. */
+#include "../spu_coherency.h"
+static atomic_uint snapshot_watch, snapshot_arrived;
+static void snapshot_data_lock(uint32_t ea)
+{
+    if (ea == 0x90000u && atomic_load(&snapshot_watch))
+        atomic_store(&snapshot_arrived, 1);
+    spu_linelock_lock(ea);
+}
 /* The unit under test. */
+#define spu_linelock_lock snapshot_data_lock
 #include "../spu_channels.c"
+#undef spu_linelock_lock
 
 /* ---------------------------------------------------------------------------
  * Harness
@@ -695,11 +706,54 @@ static void test_producer_keeps_peer_event(unsigned bit)
     }
 }
 
+/* A writer is deliberately stopped between two halves of a line update.
+ * GETLLAR must wait, then return the completed image in BOTH LS and snapshot.
+ * The lock-entry observer establishes overlap without scheduling sleeps. */
+static atomic_uint snapshot_done;
+static void* snapshot_reader(void* unused)
+{
+    (void)unused;
+    spu_atomic(&g_a, LSA_A, 0x90000u, MFC_GETLLAR_CMD);
+    atomic_store(&snapshot_done, 1);return NULL;
+}
+static void test_eventflag_snapshot_consistency(void)
+{
+    reset_pair();
+    const uint32_t ea=0x90000u;
+    spu_mark_event_flag_line(ea);
+    for (unsigned round=1;round<=32;round++) {
+        uint8_t expected[128];
+        for(unsigned i=0;i<128;i++) expected[i]=(uint8_t)(round+i*3);
+        memset(g_guest_mem+ea,0,128);
+        atomic_store(&snapshot_arrived,0);atomic_store(&snapshot_done,0);
+        spu_linelock_lock(ea);
+        memcpy(g_guest_mem+ea,expected,64);
+        atomic_store(&snapshot_watch,1);
+        pthread_t t;
+        if(pthread_create(&t,NULL,snapshot_reader,NULL)!=0) abort();
+        for(unsigned i=0;i<2000;i++) {
+            if(atomic_load(&snapshot_arrived)||atomic_load(&snapshot_done))break;
+            Sleep(1);
+        }
+        TEST("EventFlag GETLLAR arrives while a multi-field writer is in flight");
+        CHECK(atomic_load(&snapshot_arrived));
+        CHECK(!atomic_load(&snapshot_done));
+        memcpy(g_guest_mem+ea+64,expected+64,64);
+        spu_linelock_release(ea);
+        pthread_join(t,NULL);atomic_store(&snapshot_watch,0);
+        TEST("EventFlag GETLLAR returns one complete image, also used as its reservation snapshot");
+        CHECK(memcmp(g_a.ls+LSA_A,expected,128)==0);
+        CHECK(memcmp(g_a.resv_line,expected,128)==0);
+        CHECK_EQ_U32(g_a.atomic_stat,4);
+    }
+}
+
 /* ===========================================================================
  * main
  * ===========================================================================*/
 int main(void)
 {
+    test_eventflag_snapshot_consistency();
     test_putllc_breaks_peer();
     test_failed_putllc_is_quiet();
     test_putlluc_breaks_peer();
