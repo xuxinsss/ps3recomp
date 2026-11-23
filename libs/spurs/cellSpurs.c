@@ -864,7 +864,7 @@ static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
 static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
 static SRWLOCK s_spurs_queue_lock = SRWLOCK_INIT;
-static u32 s_spurs_port_queue[64];
+static u8 s_spurs_queue_port[MAX_SPURS_QUEUES];
 
 /* Release anyone blocked on the completion queues SPURS attached; see
  * cellSpursFinalize. */
@@ -878,12 +878,11 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
         u32 owner = s_spurs_event_queue_owner[i];
         if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
             u32 q = s_spurs_event_queue[i];
-            for (u32 p = 0; p < 64; p++)
-                if (s_spurs_port_queue[p] == q) s_spurs_port_queue[p] = 0;
             sys_event_queue_cancel_by_id(q);
         } else {
             s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
             s_spurs_event_queue_owner[keep] = owner;
+            s_spurs_queue_port[keep] = s_spurs_queue_port[i];
             keep++;
         }
     }
@@ -899,59 +898,49 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
  * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
  * stalls on the first physics step that way (port 2), and the PPU step waits
  * for it forever. */
+static int port_binding(u32 owner, u32 port)
+{
+    for (int i = 0; i < s_spurs_event_queue_n; ++i)
+        if (s_spurs_queue_port[i] == port && (!owner || s_spurs_event_queue_owner[i] == owner))
+            return i;
+    return -1;
+}
+
 uint32_t spurs_port_queue(uint32_t port)
 {
     AcquireSRWLockShared(&s_spurs_queue_lock);
-    u32 q = port < 64 ? s_spurs_port_queue[port] : 0;
+    int i = port_binding(0, port);
+    u32 q = i < 0 ? 0 : s_spurs_event_queue[i];
     ReleaseSRWLockShared(&s_spurs_queue_lock);
     return q;
 }
 
-s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
-                                 s32 isDynamic)
+s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDynamic)
 {
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    u32 owner = (u32)(uintptr_t)spurs;
+    u8* out = GUEST_PTR(port, u8*);
+    u32 p = *out;
+    if (!queue || (!isDynamic && p >= 64)) return CELL_SPURS_CORE_ERROR_INVAL;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    /* KEEP the queue id. SPURS signals the application through the queue it
-     * attaches here, and this discarded it -- so nothing SPURS ever did could
-     * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
-     * kicks its job chain and then blocks on exactly that receive. */
-    if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
-        /* A previous cellSpursFinalize may have cancelled this queue. Attaching
-         * gives it a producer again, so lift that -- otherwise a title that
-         * tears its audio down and brings it back finds every receive failing. */
-        sys_event_queue_uncancel_by_id(queue);
-        int dup = 0;
-        for (int i = 0; i < s_spurs_event_queue_n; i++)
-            if (s_spurs_event_queue[i] == queue) dup = 1;
-        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
-                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
-    }
-
-    u8* port_h = GUEST_PTR(port, u8*);
-
-    /* Static: the caller names the port in *port. Dynamic: pick a free one,
-     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
-     * and hand it back. This used to write 0 either way, so every attach
-     * landed on port 0 and the SPU's real port number routed nowhere. */
-    u32 p = *port_h;
     if (isDynamic) {
-        p = 64;
-        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        if (p == 64) { ReleaseSRWLockExclusive(&s_spurs_queue_lock); return CELL_SPURS_CORE_ERROR_BUSY; }
-        *port_h = (u8)p;
-    } else if (p >= 64) {
-        ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-        return CELL_SPURS_CORE_ERROR_INVAL;
-    } else if (s_spurs_port_queue[p]) {
+        for (u32 i = 0; i < 64; ++i) {
+            p = (16 + i) % 64;
+            if (port_binding(owner, p) < 0) break;
+        }
+    }
+    if (s_spurs_event_queue_n == MAX_SPURS_QUEUES || port_binding(owner, p) >= 0) {
         ReleaseSRWLockExclusive(&s_spurs_queue_lock);
         return CELL_SPURS_CORE_ERROR_BUSY;
     }
-    s_spurs_port_queue[p] = queue;
-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
-           isDynamic ? " (dynamic)" : "");
+    int i = s_spurs_event_queue_n++;
+    s_spurs_event_queue[i] = queue;
+    s_spurs_event_queue_owner[i] = owner;
+    s_spurs_queue_port[i] = (u8)p;
+    sys_event_queue_uncancel_by_id(queue);
+    *out = (u8)p;
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+    printf("[cellSpurs] AttachLv2EventQueue(owner=0x%08X queue=%u port=%u)\n",owner,queue,p);
     return CELL_OK;
 }
 
@@ -959,9 +948,14 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    if (port < 64) s_spurs_port_queue[port] = 0;
+    int i = port_binding((u32)(uintptr_t)spurs, port);
+    if (i >= 0) {
+        int last = --s_spurs_event_queue_n;
+        s_spurs_event_queue[i] = s_spurs_event_queue[last];
+        s_spurs_event_queue_owner[i] = s_spurs_event_queue_owner[last];
+        s_spurs_queue_port[i] = s_spurs_queue_port[last];
+    }
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-    printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
     return CELL_OK;
 }
 
@@ -2764,11 +2758,15 @@ enum {
  * to the game; we track what we need beside it). */
 #define MAX_JOBCHAINS 32
 static struct {
+    u32 owner_ea;
     u32 jc_ea;        /* CellSpursJobChain EA (0 = free) */
     u32 entry_ea;     /* first command word EA */
     u16 size_desc;
     u16 max_grab;
     int run_count;
+    u32 parked_pc, parked_link;
+    volatile long pending;
+    int append_mode;
     volatile long running;   /* 1 while a host thread walks this chain */
 } s_jobchains[MAX_JOBCHAINS];
 
@@ -2826,16 +2824,21 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
 }
 
 /* Register (or re-register) a job chain handle. Shared by both Create forms. */
-static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+static s32 jc_register(u32 owner_ea, u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
                        const char* who)
 {
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
+            s_jobchains[i].owner_ea  = owner_ea;
             s_jobchains[i].jc_ea     = jc_ea;
             s_jobchains[i].entry_ea  = entry_ea;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
             s_jobchains[i].run_count = 0;
+            s_jobchains[i].parked_pc = entry_ea;
+            s_jobchains[i].parked_link = 0;
+            s_jobchains[i].pending = 0;
+            s_jobchains[i].append_mode = getenv("SPURS_APPEND_CHAIN") != NULL;
             return CELL_OK;
         }
     }
@@ -2869,7 +2872,7 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
-    return jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+    return jc_register((u32)spurs_ea, (u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
                        "CreateJobChainWithAttribute");
 }
 
@@ -2904,7 +2907,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
         if (entry_ea && (u32)entry_ea < 0x10000000u)
             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
-    return jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+    return jc_register((u32)spurs_ea, (u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
                        (u16)maxGrabbedJob, "CreateJobChain");
 }
 
@@ -3140,7 +3143,7 @@ static u64 spurs_event_data3_probe(void)
     return (u64)(unsigned)v;
 }
 
-static void jc_signal_done(u32 jc_ea, int job_index)
+static void jc_signal_done(u32 owner_ea, u32 jc_ea, int job_index)
 {
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
@@ -3181,6 +3184,7 @@ static void jc_signal_done(u32 jc_ea, int job_index)
         g_spurs_job_mbox_valid = 0;
     }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        if (s_spurs_event_queue_owner[i] != owner_ea) continue;
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                             SPURS_EVENT_PORT, jc_ea, d2,
                                             d3_probe_valid
@@ -3195,9 +3199,10 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     }
 }
 
-static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc, int slot)
 {
-    u32 pc = entry_ea, ret_pc = 0;
+    u32 pc = s_jobchains[slot].append_mode ? s_jobchains[slot].parked_pc : entry_ea;
+    u32 ret_pc = s_jobchains[slot].append_mode ? s_jobchains[slot].parked_link : 0;
     int jobs = 0;
     /* Bound IDLE steps, not total steps. A SPURS job chain is frequently a
      * SERVICE LOOP -- guard, job, sync, next, repeat -- and is meant to run for
@@ -3223,7 +3228,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
              * and sat in event_queue_receive 30 times -- so batching the
              * completion into one event per pass leaves it waiting for
              * completions that, from its point of view, never arrive. */
-            jc_signal_done(jc_ea, idx);
+            jc_signal_done(s_jobchains[slot].owner_ea, jc_ea, idx);
             pc += 8; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
@@ -3231,8 +3236,10 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
+                s_jobchains[slot].parked_pc = pc;
+                s_jobchains[slot].parked_link = ret_pc;
                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
-                if (jobs) jc_signal_done(jc_ea, jobs - 1);
+                if (jobs) jc_signal_done(s_jobchains[slot].owner_ea, jc_ea, jobs - 1);
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
@@ -3269,12 +3276,18 @@ static DWORD WINAPI jc_thread(LPVOID p)
      * Confirms timing-vs-never before committing to the async rewrite. */
     { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
-    jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
-               s_jobchains[slot].size_desc);
-    s_jobchains[slot].running = 0;
+    for (;;) {
+        _InterlockedExchange(&s_jobchains[slot].pending, 0);
+        jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                   s_jobchains[slot].size_desc, slot);
+        _InterlockedExchange(&s_jobchains[slot].running, 0);
+        if (!s_jobchains[slot].append_mode ||
+            !_InterlockedCompareExchange(&s_jobchains[slot].pending, 0, 0) ||
+            _InterlockedCompareExchange(&s_jobchains[slot].running, 1, 0) != 0) break;
+    }
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
-    jc_signal_done(s_jobchains[slot].jc_ea, -1);
+    jc_signal_done(s_jobchains[slot].owner_ea, s_jobchains[slot].jc_ea, -1);
     return 0;
 }
 
@@ -3305,6 +3318,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+        if (s_jobchains[i].append_mode) _InterlockedExchange(&s_jobchains[i].pending, 1);
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
