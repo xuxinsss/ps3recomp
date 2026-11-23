@@ -189,12 +189,16 @@ add_executable(${PROJECT_NAME}
 #   -O2                 -- the target-wide -O1 exists for the huge PPU TUs; the
 #                          SPU sources are small and decode-hot, so they get
 #                          full optimization. The last -O on the line wins.
+option(PS3RECOMP_NATIVE_SPU "Build lifted SPU code for the local CPU" OFF)
 if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        if(PS3RECOMP_NATIVE_SPU)
+            set_property(SOURCE ${SPU_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -march=native -ffp-contract=off)
+        endif()
     endif()
 endif()
 
