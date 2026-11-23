@@ -127,6 +127,8 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
  * represented as fp_constants[N] in a b1 PSConstants cbuffer rather than
  * printed as HLSL literals. `out_constant_count` receives the exact slot
  * count and may be NULL. */
+int rsx_fp_decompile_d3d12(const u8* ucode, u32 max_bytes, u32 ctrl,
+                           u32 tex_cube_mask, char* out, u32 out_size);
 int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     char* out, u32 out_size, u32* out_constant_count);

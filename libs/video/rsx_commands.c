@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "rsx_vertex_formats.h"
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -836,12 +837,28 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
 
+    /* Inline values are FIFO words in guest byte order. Decode only after
+     * END, when all packets belonging to this primitive have arrived. */
+    if (method == 0x1818 && state->in_begin_end) {
+        if (s_backend && s_backend->supports_inline_arrays) {
+            u32 n = state->inline_bytes;
+            if (n <= sizeof(state->inline_data) - 4) {
+                state->inline_data[n] = (u8)(data >> 24);
+                state->inline_data[n+1] = (u8)(data >> 16);
+                state->inline_data[n+2] = (u8)(data >> 8);
+                state->inline_data[n+3] = (u8)data;
+                state->inline_bytes += 4;
+            } else state->inline_bytes = sizeof(state->inline_data) + 1;
+        }
+        return 0;
+    }
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
+            state->inline_bytes = 0;
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
@@ -884,6 +901,25 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 state->texture_dirty = 0;
             }
         } else {
+            if (state->inline_bytes && state->inline_bytes <= sizeof(state->inline_data) &&
+                s_backend && s_backend->supports_inline_arrays && s_backend->draw_arrays) {
+                u32 packed = 0, declared = 0;
+                for (int i = 0; i < RSX_MAX_VERTEX_ATTRIBS; ++i) {
+                    const rsx_vertex_attrib* a = &state->vertex_attribs[i];
+                    state->inline_offset[i] = packed;
+                    if (!a->enabled || !a->type) continue;
+                    packed += rsx_vertex_attrib_size(a->type, a->size);
+                    if (a->stride > declared) declared = a->stride;
+                }
+                u32 stride = declared ? declared : packed;
+                if (stride && packed && packed <= stride && state->inline_bytes >= stride) {
+                    state->inline_stride = stride;
+                    s_backend->draw_arrays(s_backend->userdata, state->primitive_type, 0,
+                                           state->inline_bytes / stride);
+                    state->inline_stride = 0;
+                }
+            }
+            state->inline_bytes = 0;
             state->in_begin_end = 0;
         }
         return 0;
@@ -929,6 +965,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->index_array_offset = data;
         return 0;
     }
+    if (method == 0x1DAC) { state->restart_enabled = data; return 0; }
+    if (method == 0x1DB0) { state->restart_index = data; return 0; }
     if (method == NV4097_SET_INDEX_ARRAY_DMA) {
         state->index_array_dma = data;
         return 0;

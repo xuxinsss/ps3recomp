@@ -337,6 +337,8 @@ typedef struct rsx_state {
     u32 frequency_divider_op;
 
     /* Current draw state */
+    u8 inline_data[65536];
+    u32 inline_bytes, inline_stride, inline_offset[RSX_MAX_VERTEX_ATTRIBS];
     u32 primitive_type;
     int in_begin_end;  /* between BEGIN_END(type) and BEGIN_END(0) */
 
@@ -350,6 +352,7 @@ typedef struct rsx_state {
     u32 begin_epoch;
     u32 index_array_offset;
     u32 index_array_dma;
+    u32 restart_enabled, restart_index;
 
     /* Shader state */
     /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,
@@ -457,6 +460,8 @@ typedef struct rsx_backend {
 
     /* Texture */
     void (*bind_texture)(void* userdata, u32 unit, const rsx_texture_state* tex);
+    void (*surface_copy)(u32 src, u32 dst, u32 pitch, u32 width, u32 height);
+    int supports_inline_arrays;
 } rsx_backend;
 
 /* Register a backend. Call before any RSX processing. */

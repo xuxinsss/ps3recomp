@@ -648,7 +648,7 @@ static int rsx_fp_decompile_internal(
             return -1;
         }
     u32 buffered_constant_count = 0;
-    if (buffered) {
+    if (buffered == 1) {
         rsx_fp_constant_block constants;
         const int result =
             rsx_fp_collect_constants(ucode, max_bytes, &constants);
@@ -1218,6 +1218,13 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, "    { float4 _d = _rsx_dbg; _d.w = 1.0;"
                          " r[0] = _d; h[0] = _d; }\n");
     }
+    if (buffered == 2) {
+        char alpha[160];
+        snprintf(alpha, sizeof(alpha),
+                 "    if (alpha_state.x != 0 && !rsx_alpha_pass(%s[0].a)) discard;\n",
+                 export_file);
+        out_puts(&o, alpha);
+    }
     if (targets == 1 && !depth_export) {
         char tail[96];
         snprintf(tail, sizeof(tail),
@@ -1306,7 +1313,15 @@ static int rsx_fp_decompile_internal(
     out_puts(&p,
         "SamplerState rsx_samp[16] : register(s0);\n"
     );
-    if (buffered) {
+    if (buffered == 2) {
+        if (constant_slot > 128) return -1;
+        out_puts(&p,
+            "cbuffer PSConstants : register(b1) { float4 texscale[4]; float4 alpha_state; float4 fp_constants[128]; };\n"
+            "#define fp_alpha float4(0,0,0,0)\n"
+            "bool rsx_alpha_pass(float a) { float b = alpha_state.y; uint f = (uint)alpha_state.z; "
+            "return f == 7 || (f == 1 && a < b) || (f == 2 && a == b) || (f == 3 && a <= b) || "
+            "(f == 4 && a > b) || (f == 5 && a != b) || (f == 6 && a >= b); }\n");
+    } else if (buffered) {
         char constants_decl[192];
         snprintf(
             constants_decl, sizeof(constants_decl),
@@ -1368,6 +1383,13 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
 {
     return rsx_fp_decompile_internal(
         ucode, max_bytes, ctrl, tex_cube_mask, 0, 0, NULL, NULL, NULL, out, out_size, NULL);
+}
+
+int rsx_fp_decompile_d3d12(const u8* ucode, u32 max_bytes, u32 ctrl,
+                           u32 tex_cube_mask, char* out, u32 out_size)
+{
+    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+        0, 2, NULL, NULL, NULL, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
