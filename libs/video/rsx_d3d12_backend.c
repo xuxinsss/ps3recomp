@@ -6469,14 +6469,28 @@ static void vs_arrays(const rsx_state* st, u32 prim, u32 count)
     vs_attrs(st);
 }
 
+/* The FIFO records draws serially. Build the input list once per draw. */
+static unsigned s_vp_active_count;
+static u8 s_vp_active_slots[16];
+
+static void vp_begin_vertex_fetch(const rsx_state* state)
+{
+    s_vp_active_count = 0;
+    if (!state) return;
+    for (unsigned slot = 0; slot < 16; ++slot) {
+        if (state->vertex_attribs[slot].enabled)
+            s_vp_active_slots[s_vp_active_count++] = (u8)slot;
+    }
+}
+
 static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
     if (s_vs_on > 0) s_vs.conv++;
     VPSlot converted[16];
     memcpy(converted, state->vertex_data4f, sizeof(converted));
-    for (int i = 0; i < 16; ++i) {
-        if (state->vertex_attribs[i].enabled)
-            rsx_fetch_attrib(state, i, vi, converted[i].v);
+    for (unsigned i = 0; i < s_vp_active_count; ++i) {
+        unsigned slot = s_vp_active_slots[i];
+        rsx_fetch_enabled_attrib(state, slot, vi, converted[slot].v);
     }
     const rsx_vertex_attrib* position = &state->vertex_attribs[0];
     u32 n = position->size ? position->size : 4;
@@ -7243,6 +7257,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 
     if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
     if (count == 0 || count > s_vertex_capacity) return;
+    vp_begin_vertex_fetch(s_d3d.current_rsx_state);
     vs_arrays(s_d3d.current_rsx_state, primitive, count);
 
     /* QUADS (prim 8) have no D3D12 topology; expand to a triangle list.
@@ -7495,6 +7510,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * list. Other primitives are skipped rather than drawn wrong. */
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
+    vp_begin_vertex_fetch(s_d3d.current_rsx_state);
     const long long vs_t0 = vs_begin_indexed(s_d3d.current_rsx_state, primitive, first, count);
     int ix_used = 0, ix_cont = 0;
     const u32 ib0 = s_d3d.vp_ib_offset;

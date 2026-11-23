@@ -38,8 +38,13 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     out[2] = st->vertex_data4f[idx][2];
     out[3] = st->vertex_data4f[idx][3];
 
+    if (st->vertex_attribs[idx].enabled)
+        rsx_fetch_enabled_attrib(st, idx, vi, out);
+}
+
+void rsx_fetch_enabled_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
+{
     const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
-    if (!a->enabled) return;
     const u8* p;
     if (st->inline_stride) {
         if (vi >= st->inline_bytes / st->inline_stride) return;
