@@ -1029,6 +1029,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                         s_wev = e2 ? strtoul(e2, 0, 0) : 64ul;
                         if (!s_wev) s_wev = 64ul; }
           if (wn <= 12 || (wn % s_wev) == 0) {
+              if ((cmd & 0xffu) == 0x20 && size >= 4 && s_wa - (uint32_t)ea <= size - 4) {
+                  unsigned off = lsa + s_wa - (uint32_t)ea;
+                  fprintf(stderr,"[put-source] image=%d pc=%05X ea=%08X ls=%05X value=%02X%02X%02X%02X\n",spu->image_id,spu->pc,s_wa,off,spu->ls[off & SPU_LS_MASK],spu->ls[(off+1)&SPU_LS_MASK],spu->ls[(off+2)&SPU_LS_MASK],spu->ls[(off+3)&SPU_LS_MASK]);
+              }
               uint32_t v; memcpy(&v, vm_base + s_wa, 4);
               v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
               fprintf(stderr, "[watchea] n=%lu spu%u cmd=0x%02X ea=0x%08X"
