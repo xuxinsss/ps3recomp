@@ -72,7 +72,7 @@ Machine: Intel i5-11400, NVIDIA RTX 3060, 1280x720, native Windows.
 Original Release SHA256:
 3e0a3afe51a8aae3b36041155245f4f2de8c6f0b103eb97a7695696449bd52cf.
 Corrected no-probe executable SHA256:
-2d438350c7baade72c442de303a799460912c4acbf4c523cc38b1c8e9002b7e5.
+5f04c142aed162add960901aa4ca255df438df9d1ec80d3bbe69ec2b51286b8a.
 
 An audible Vulkan diagnostic build measured 15.466 FPS, median 64.463 ms,
 p95 68.191 ms, on 81 distinct flips / 80 intervals, after NEW GAME input,
@@ -97,3 +97,22 @@ foreground flower field, canopy contours, strip-free foreground and subtitles
 were captured. Audio remained nonzero through the ending sample, with zero
 reported dropped frames/underruns in the sampled rate reports. Its private
 HDD/save roots were separate. The test process was stopped at the time limit.
+
+The measured frame-only diagnostic executable is separately retained with SHA256
+2d438350c7baade72c442de303a799460912c4acbf4c523cc38b1c8e9002b7e5.
+Its first timing window contained 61 zero-draw duplicate presents, all excluded.
+Further 80-interval windows were 15.322, 16.464 and 16.800 FPS.
+
+Delivery audit caught a stale object: restoring a source backup preserved its old
+mtime, so Ninja initially reused the instrumented object. That intermediate EXE
+is not a no-probe deliverable. Touching and rebuilding the restored source
+produced the final 5f04... EXE; its frame-probe string is absent, the diagnostic
+EXE retains it, and production sources compare equal to this fork branch.
+
+## Owner's change-recording convention
+
+Meaningful SDK/base-layer changes should be recorded in this GitHub fork with
+an explanation of the cause, scope, validation and known limits, so later work
+can recover the reasoning. Keep game launch settings and optional measurement
+instrumentation clearly distinguished from reusable SDK fixes. This session
+records them on its own branch; upstream PR work remains paused.
