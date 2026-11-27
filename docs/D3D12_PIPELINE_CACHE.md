@@ -54,3 +54,11 @@ opening white flowers and correct forest foliage. These are repeatable route
 windows, not identical animated frames or claims about all future pipelines.
 The cache is learned from a previous run; unlike embedded Cg preparation,
 it does not predict unseen shader/state combinations.
+
+Clean production regression (temporary field probes removed): EXE SHA256
+`db504fec232d8361a64d6d83b4b76d59dea5b2d92c66034984a32299c89b52e7`.
+A 35-second opening FIFO-consumption trace contained 801 flips / 800 intervals,
+22.877 FPS, median 44.510 ms, P95 56.157 ms and maximum 100.288 ms (one interval
+above 100 ms, zero trace drops). Prior DXBC-only production runs had maxima
+244.448/244.236 ms. Screenshots were disabled during this measurement.
+This is a scene-progress window, not an identical-frame speedup percentage.
