@@ -14,3 +14,21 @@ with tempfile.TemporaryDirectory(prefix='legacy-d3d12-') as tmp:
              '/Fe:'+str(binary)]
     subprocess.run(command,cwd=tmp,env=environ(),check=True)
     subprocess.run([str(binary)],cwd=tmp,check=True,timeout=15)
+
+# Use the real Windows HLSL compiler for the point-expanded vertex shader.
+with tempfile.TemporaryDirectory(prefix='d3d12-point-quad-') as tmp:
+    binary=Path(tmp)/'test.exe'
+    command=[os.environ.get('CC','clang-cl'),'/nologo','/W0','/UNDEBUG',
+             '/D_CRT_SECURE_NO_WARNINGS','/I'+str(root/'libs/video'),
+             str(root/'libs/video/tests/test_d3d12_point_quad.c'),'/Fe:'+str(binary)]
+    subprocess.run(command,cwd=tmp,env=environ(),check=True)
+    subprocess.run([str(binary)],cwd=tmp,check=True,timeout=15)
+
+# Render/read back pixels with D3D12 WARP across nonzero draw offsets.
+with tempfile.TemporaryDirectory(prefix='d3d12-point-gpu-') as tmp:
+    binary=Path(tmp)/'test.exe'
+    command=[os.environ.get('CC','clang-cl'),'/nologo','/W0','/UNDEBUG',
+             '/EHsc','/I'+str(root/'libs/video'),
+             str(root/'libs/video/tests/test_d3d12_point_quad_gpu.cpp'),'/Fe:'+str(binary)]
+    subprocess.run(command,cwd=tmp,env=environ(),check=True)
+    subprocess.run([str(binary)],cwd=tmp,check=True,timeout=30)

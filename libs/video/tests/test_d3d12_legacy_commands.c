@@ -28,6 +28,11 @@ static void draw(void* opaque,u32 topology,u32 first,u32 count) {
 int main(void) {
  rsx_backend backend={0}; backend.supports_inline_arrays=1; backend.draw_arrays=draw;
  rsx_state_init(&state); rsx_set_backend(&backend);
+ assert(state.point_size==1.0f);
+ rsx_process_method(&state,0x1EE0,0x41800000u);
+ rsx_process_method(&state,0x1EE8,0x1001u);
+ assert(state.point_size==16.0f && state.point_sprite_control==0x1001u);
+
  state.vertex_attribs[0].enabled=1; state.vertex_attribs[0].type=2;
  state.vertex_attribs[0].size=2; state.vertex_attribs[0].stride=8;
  state.vertex_data4f[0][2]=9.0f;
