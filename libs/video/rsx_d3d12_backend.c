@@ -84,6 +84,7 @@ typedef struct {
     int textured;       /* 1 = sample the bound font/atlas texture (dbgfont) */
     int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4) */
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
+    u32 fp_sampled_units; /* actual FP reads; stale bound units are not dependencies */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     u32 fp_ctrl;        /* SET_SHADER_CONTROL export bits at draw time (FP_CTRL_BITS) */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
@@ -246,6 +247,7 @@ typedef struct {
  * PS (fragment ucode at fp_addr). */
 typedef struct {
     u32 fp_addr;
+    u32 sampled_units;
     int vs_idx;             /* VPVSEntry slot this PSO's VS came from */
     u32 vs_hash;            /* validates the slot hasn't been evicted */
     u32 gen;
@@ -2350,8 +2352,9 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
-                                          u32 cube_mask, u64 zs)
+                                          u32 cube_mask, u64 zs, u32* sampled_units)
 {
+    if (sampled_units) *sampled_units = 0xFFFFu; /* conservative failure fallback */
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;   /* 0: a depth-only pass */
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
@@ -2410,7 +2413,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull &&
             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs)
+        {
+            if (sampled_units) *sampled_units = s_d3d.vp_fp[i].sampled_units;
             return s_d3d.vp_fp[i].pso;
+        }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -2776,6 +2782,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
         s_d3d.vp_fp_n = VP_FP_CACHE - 1;
     }
+    const u32 units = rsx_fp_texture_units(vm_base + off, 4096);
+    s_d3d.vp_fp[s_d3d.vp_fp_n].sampled_units = units;
+    if (sampled_units) *sampled_units = units;
     s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
     s_d3d.vp_fp[s_d3d.vp_fp_n].vs_idx  = vs_idx;
     s_d3d.vp_fp[s_d3d.vp_fp_n].vs_hash = vs_hash;
@@ -5004,12 +5013,13 @@ static void render_frame(void)
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
+        dr->fp_sampled_units = dr->textured ? 1u : 0u;
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_ctrl, dr->cmask, dr->cull, dr_cube_mask(dr),
-                                       dr->zs_key);
+                                       dr->zs_key, &dr->fp_sampled_units);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -5259,7 +5269,15 @@ static void render_frame(void)
                 if (!dr->rt_off && !dr->no_color) display_dirty = 1;
                 for (int _u = 0; _u < RSX_MAX_TEXTURES; _u++) {
                     const int ds = dr->tex_ds[_u];
-                    if (ds < 0 || ds == cur_z || s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
+                    /* A draw may sample the depth surface still bound as DSV.
+                     * It reads a separate colour snapshot: refresh that snapshot
+                     * before the draw, then restore the guest attachments below.
+                     * Skipping the current DSV leaves old depth under current
+                     * geometry (visible as false contours on animated models).
+                     * Only actual FP reads are dependencies; enabled but unused
+                     * texture registers must not trigger a copy per geometry draw. */
+                    if (!(dr->fp_sampled_units & (1u << _u)) || ds < 0 ||
+                        s_d3d.off_ds[ds].conv_gen == s_d3d.off_ds[ds].gen)
                         continue;
                     ds_convert(ds, dr->tex_rt[_u]);
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
@@ -5436,7 +5454,7 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_ctrl, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr), dr->zs_key) : NULL;
+                                                dr_cube_mask(dr), dr->zs_key, NULL) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 s_d3d.cmd_list->lpVtbl->OMSetStencilRef(s_d3d.cmd_list, dr->stencil_ref & 0xFFu);
