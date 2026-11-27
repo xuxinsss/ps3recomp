@@ -75,7 +75,7 @@ Corrected no-probe executable SHA256:
 2d438350c7baade72c442de303a799460912c4acbf4c523cc38b1c8e9002b7e5.
 
 An audible Vulkan diagnostic build measured 15.466 FPS, median 64.463 ms,
-p95 68.370 ms, on 81 distinct flips / 80 intervals, after NEW GAME input,
+p95 68.191 ms, on 81 distinct flips / 80 intervals, after NEW GAME input,
 with guest_draws >=1000 (median 1478). Zero-draw presents were excluded.
 An unmodified original Release run measured 21.766 FIFO flips/s, median
 46.188 ms, p95 57.332 ms on 81 successive consumed guest flips / 80 intervals
@@ -91,3 +91,9 @@ version restores it. Screenshots and performance runs are separate. Shader
 startup, scheduling and different diagnostic overhead limit causal comparisons.
 No 30 FPS claim, full-game claim, combat/Load regression or upstream publication
 is made. Raw captures and logs stay private and are not included here.
+
+Final no-probe, audible 145-second Windows regression completed: title gem,
+foreground flower field, canopy contours, strip-free foreground and subtitles
+were captured. Audio remained nonzero through the ending sample, with zero
+reported dropped frames/underruns in the sampled rate reports. Its private
+HDD/save roots were separate. The test process was stopped at the time limit.
