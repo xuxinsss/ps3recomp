@@ -1131,6 +1131,13 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
         u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, bytes);
         if (!dst) return;
         u8* src = rows + (size_t)r * n * bpp;
+        /* A linear whole-pixel RGBA row can be converted straight into guest
+         * memory. Avoid rotating the readback scratch in place and then
+         * copying it again. Tiled, FP16 and partial pixels keep the old path. */
+        if (bpp == 4u && !skip && !(bytes & 3u) && !rsx_tiling_active()) {
+            eng_row_convert(dst, src, bytes / 4u, rgba, 1);
+            continue;
+        }
         if (bpp == 8u) {
             /* R,G,B,A halves, each stored big-endian: the layout
              * rsx_texture_decode reads W16_Z16_Y16_X16_FLOAT from. */
