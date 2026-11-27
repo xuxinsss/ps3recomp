@@ -48,6 +48,7 @@
 #include <d3dcompiler.h>
 #include "rsx_vertex_float_plan.h"
 #include "rsx_d3d12_shader_cache.h"
+#include "rsx_d3d12_pipeline_cache.h"
 #include "rsx_d3d12_null_srv.h"
 #define D3DCompile rsx_d3d12_compile_cached
 
@@ -342,6 +343,7 @@ typedef struct {
      * used as the vertex shader, fed the raw float4 attrib0 + the vp_c[]
      * constant bank. This produces exact position + texcoord (vs. the frac
      * approximation). Used for the 2D/dbgfont quad draws. */
+    ID3DBlob* vp_root_blob;
     ID3D12RootSignature*  vp_root_sig;          /* CBV(b0) + SRV table + sampler */
     ID3D12PipelineState*  pipeline_state_vp;    /* decompiled VS + atlas PS      */
     ID3D12PipelineState*  pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
@@ -1397,6 +1399,7 @@ static int init_d3d12(u32 width, u32 height)
             s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
                 sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
                 &IID_ID3D12RootSignature, (void**)&s_d3d.vp_root_sig);
+            s_d3d.vp_root_blob=sig;sig->lpVtbl->AddRef(sig);
             sig->lpVtbl->Release(sig);
         } else if (err) { printf("[D3D12] VP root sig: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); }
 
@@ -2753,8 +2756,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.SampleDesc.Count = 1;
 
     ID3D12PipelineState* pso = NULL;
-    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-        s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    hr = rsx_d3d12_create_pso_cached(s_d3d.device,&pd,
+        s_d3d.vp_root_blob?s_d3d.vp_root_blob->lpVtbl->GetBufferPointer(s_d3d.vp_root_blob):NULL,
+        s_d3d.vp_root_blob?s_d3d.vp_root_blob->lpVtbl->GetBufferSize(s_d3d.vp_root_blob):0,&pso);
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
         static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
@@ -7959,6 +7963,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
     if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
+    if (s_d3d.vp_root_blob) s_d3d.vp_root_blob->lpVtbl->Release(s_d3d.vp_root_blob);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);

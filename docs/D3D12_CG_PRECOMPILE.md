@@ -79,3 +79,9 @@ rendering thread. This is not a claim of hitch-free gameplay or 30 FPS.
 The warm preparation wrapper completed in 2.039 s (workers 0.125-0.141 s).
 The earlier 138.279 s preparation measurement reused a partially populated
 experimental cache and must not be reported as an empty-cache startup time.
+
+Follow-up: the remaining driver creation stalls were addressed by the optional
+persistent PSO cache described in [D3D12_PIPELINE_CACHE.md](D3D12_PIPELINE_CACHE.md).
+With retained hardware blobs, the two first-use window maxima became 71.784
+and 68.402 ms. Empty-cache four-worker ELF preparation took 252.228 s,
+compiled all 1554 variant requests into 1348 unique entries with no failures.
