@@ -214,3 +214,30 @@ hung windows were neither controlled nor terminated. Original Release SHA256
 3e0a3afe51a8aae3b36041155245f4f2de8c6f0b103eb97a7695696449bd52cf and the
 independent Vulkan EXE SHA256
 5f04c142aed162add960901aa4ca255df438df9d1ec80d3bbe69ec2b51286b8a remain unchanged.
+
+## Forest vegetation: respect guest sampler LOD bounds
+
+User gameplay revealed thick black fringes around forest grass, flowers and
+leaves. Independent forest-entry captures reproduced them. The legacy D3D12
+sampler decoded bias and filtering but discarded TEXTURE_CONTROL0's minimum
+and maximum LOD. In this scene, unit 1 is a separate vegetation mask with
+control0=0x80000000 and filter=0x01032000: mip filtering is selected but both
+guest LOD bounds are zero. Allowing arbitrary mip levels misaligned that mask
+with the colour texture. For example, the 512x512 leaf colour atlas instead
+uses control0=0x80048000 (levels 0..9) and filter=0x02063F00 (bias -1).
+
+The sampler now decodes both unsigned 8-fractional-bit bounds and clamps an
+inverted interval. Non-mipmapped filters use the minimum level. This agrees
+with the existing Vulkan sampler's register interpretation. Alpha test,
+blending, shader code and textures remain unchanged. Forcing alpha reference
+0.5 was only an earlier diagnostic and is NOT part of the fix; it removed
+too much foliage. Captured anti-alias control was FFFF0000/FFFF0001, with no
+alpha-to-coverage enable, so that hypothesis was rejected too.
+
+Local evidence: es-v020-win/runs/d3d12-field-diagnostic-03/rsxcap/frame_9000
+(before) and d3d12-field-diagnostic-04/rsxcap/frame_9000 (after), same static
+forest-entry camera. Thick black outlines are visibly removed by the LOD fix.
+These captures include diagnostic instrumentation and are not FPS benchmarks.
+The standalone sampler regression covers this exact mask/colour pair,
+fractional bounds, non-mip filtering and inverted bounds. All legacy command,
+point-quad compiler, WARP, shader-cache and bit-exact vertex tests also pass.

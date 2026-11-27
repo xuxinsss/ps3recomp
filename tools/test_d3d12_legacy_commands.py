@@ -4,6 +4,13 @@ import os, subprocess, tempfile
 from pathlib import Path
 from msvc_env import environ
 root=Path(__file__).resolve().parents[1]
+with tempfile.TemporaryDirectory(prefix='d3d12-sampler-') as tmp:
+    binary=Path(tmp)/'test.exe'
+    subprocess.run([os.environ.get('CC','clang-cl'),'/nologo','/W0','/UNDEBUG',
+                    '/I'+str(root/'libs/video'),str(root/'libs/video/tests/test_d3d12_sampler.c'),
+                    '/Fe:'+str(binary)],cwd=tmp,env=environ(),check=True)
+    subprocess.run([str(binary)],cwd=tmp,check=True,timeout=15)
+
 with tempfile.TemporaryDirectory(prefix='legacy-d3d12-') as tmp:
     binary=Path(tmp)/'test.exe'
     sources=['libs/video/tests/test_d3d12_legacy_commands.c',
