@@ -87,7 +87,7 @@ Previous audio validation produced nonzero PCM with no sampled device drops.
 Correctness checkpoint EXE SHA256:
 d10e9cebd0decd8e7aaf1caace679a150c464156c8d5b7ffda95e9000481af5f
 
-## Performance checkpoint and outstanding hitch
+## Performance before the hitch fix
 
 No-screenshot run d3d12-flowers-final-perf-01: 770 consumed FIFO flips between
 55.045 and 89.987 seconds, 22.008 flips/s; median 44.156 ms, P95 58.813 ms.
@@ -108,3 +108,109 @@ The final checkpoint averages 24.827 flips/s in seconds 65-75, then 20.187
 in seconds 79-89 (original: 23.518 then 20.560). The owner notices both the
 stall and sustained slowdown. They are not solved by the flower correction.
 Further performance investigation must preserve this correctness checkpoint.
+
+
+## Hitch diagnosis and retained fixes
+
+A diagnostic build timed actual D3DCompile calls and CreateGraphicsPipelineState
+separately. At the camera transition, two vertex shader compiles took about
+302/298 ms. Many fragment shaders were compiled repeatedly under different
+complete PSO state keys: 122 compiler calls contained only 73 distinct HLSL
+sources. PSO creation itself was about 0.1-0.8 ms per measured call. Diagnostic
+sampling, timers, shader dumps and the stage CSV writer are not in production.
+
+The new DXBC cache retains the original complete PSO keys and generated HLSL.
+It reuses bytecode only after matching the exact source, entry point, target,
+compile flags and compiler DLL identity. On disk, bounded lengths, exact source,
+DXBC magic and payload checksum reject truncated/corrupt/mismatched entries;
+failed writes fall back to compiling. Includes/macros bypass the cache.
+The in-memory cache is bounded to 128 entries and 32 MiB. Disk writes use an
+atomic per-process/per-thread temporary file. It stores DXBC, not driver PSOs.
+
+PS3RECOMP_D3D12_SHADER_CACHE selects a local persistent directory. The local
+launcher uses F:\ps3-revise\es-v020-win\dxbc-cache-v2. No game-generated HLSL
+or DXBC is committed. Without this variable only the process-memory cache is
+used. PS3RECOMP_D3D12_SHADER_CACHE_DISABLE=1 restores the compiler path.
+The identity is taken from d3dcompiler_47.dll, not the EXE import thunk, so
+rebuilding the game does not invalidate otherwise identical shaders. A cold
+cache can still hitch when a shader is encountered for the first time.
+
+Two smaller CPU changes are retained. The per-draw descriptor window remembers
+identical null SRVs; every real resource write invalidates that slot. No real
+resource pointers or batched-SRV scheme are cached. Plain float vertex fetches
+prepare layout once per draw, retain MAIN address resolution per vertex, and
+fall back for inline data, nonplain frequency, zero stride and other formats.
+Vertex data is never cached across draws. The opt-outs are
+RSX_D3D12_NULL_SRV_CACHE_DISABLE and RSX_VERTEX_FLOAT_PLAN_DISABLE (presence).
+
+Tests run the actual Windows compiler and D3D12 WARP, cache memory/disk reuse,
+flags/profile/source separation, corrupted/truncated fallback, compiler errors,
+null-to-resource-to-null invalidation, and 1,080 bit-exact scalar-vs-prepared
+float fetches across 108 layouts including MAIN page remapping/index wrap.
+A temporary in-game sampled scalar comparison also checks the optimized float
+fetch against the original decoder; this audit is removed from production.
+
+## Sustained frame-rate limit and rejected experiments
+
+The hitch and sustained slowdown have different causes. Once shaders are warm,
+the heroine camera still increases submitted draws from roughly 2,400 to
+3,500-4,000. Native CPU sampling identifies vertex decoding/upload, texture and
+fragment-program hashing, descriptor setup and driver calls; compile misses
+have already stopped. This work does not claim to solve the remaining CPU cost.
+
+Diagnostic camera-aligned windows count only nonempty draws and changing guest
+flip IDs, not repeated host presents. The first >=3,300-draw frame anchors the
+heroine entrance. Each comparison uses 200 intervals starting 10 and 210 frames
+after that anchor, with similar draw counts rather than wall-clock alignment.
+Cache/null-view baseline: 21.589 / 19.643 FPS. Adding prepared float fetch:
+21.983 / 20.416 FPS. The small change should be treated as modest, not a large
+speedup; all compared diagnostic builds use the same sampler/stage writer.
+
+Strip deduplication added only about 1% beyond the float path in one run and
+was removed. An additional input-mask experiment had no stable gain and was
+removed. D3D12_VSYNC=0 measured 21.990 / 20.606 FPS versus the corresponding
+strip candidate's 22.185 / 20.628 FPS, so production keeps VSync on. These local
+experiments and their diagnostic source snapshots are not production patches.
+
+A warm-cache preliminary no-screenshot run reduced the former 674/799-ms stalls
+to a maximum interval of 86.084 ms, with zero intervals above 100 ms in the
+35-second gameplay trace. This is cache-warm opening evidence, not a guarantee
+against first-use compilation or a whole-game stutter-free claim.
+
+
+## Final production verification (2026-11-27)
+
+Production EXE SHA256:
+25a83a34f14886e42a0e68ed2ffd63e048b3ae690ed1912d646057d3644eda69
+
+The clean Release build removes the temporary sampler call, linker sampling
+map, stage CSV writer and scalar audit. Run d3d12-production-final-perf-01 uses
+this exact EXE with no screenshots and no native sampling. Existing opt-in FIFO
+tracing counts 791 consumed flips / 790 intervals between 55.000 and 89.982 s:
+22.583 FPS, median 44.855 ms, P95 58.142 ms, maximum 72.449 ms, zero intervals
+above 100 ms, zero trace drops. The earlier flower-correct build measured
+22.008 FPS with maximum 799.398 ms; original Release measured 21.282 FPS with
+maximum 828.484 ms. Original lacks flowers, so its load is not equivalent.
+Wall-clock-aligned averages also advance through the camera at different rates;
+use the camera-stage comparison above for sustained-cost interpretation.
+
+This final run has a warm persistent cache. All 75 existing cache files retain
+their sizes and modification times across the final rebuild and gameplay run,
+confirming reuse across EXE changes. New scenes can still cause first-use
+compilation. This is a bounded opening regression, not a 30 FPS claim.
+
+The matching optimized renderer was tested in a separate 150-second visual/
+audio/audit run: d3d12-final-float-audio-sequence-01. It captured 160 frames every
+six guest flips, including title gem, tree canopy, flower field, heroine entry,
+rear view, face close-up and subtitles. Flowers remained complete in the
+reviewed later shots. A 1-in-64 sample of eligible attribute fetches compared
+11,900,000 vectors bit-for-bit against the original scalar decoder without a
+mismatch. Nonzero PCM peaks reached 0.3604; sampled audio-rate records report
+zero dropped frames and zero underruns. This diagnostic run is not an FPS test.
+
+All test-run returncode=1 entries accompanied by stopped_own_process=true are
+intentional deadline terminations of processes created for the test. Original
+hung windows were neither controlled nor terminated. Original Release SHA256
+3e0a3afe51a8aae3b36041155245f4f2de8c6f0b103eb97a7695696449bd52cf and the
+independent Vulkan EXE SHA256
+5f04c142aed162add960901aa4ca255df438df9d1ec80d3bbe69ec2b51286b8a remain unchanged.

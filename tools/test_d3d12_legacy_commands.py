@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run the legacy D3D12 command bridge regression on Windows."""
+"""Run Windows legacy command, GPU point-sprite, cache and vertex regressions."""
 import os, subprocess, tempfile
 from pathlib import Path
 from msvc_env import environ
@@ -31,4 +31,19 @@ with tempfile.TemporaryDirectory(prefix='d3d12-point-gpu-') as tmp:
              '/EHsc','/I'+str(root/'libs/video'),
              str(root/'libs/video/tests/test_d3d12_point_quad_gpu.cpp'),'/Fe:'+str(binary)]
     subprocess.run(command,cwd=tmp,env=environ(),check=True)
+    subprocess.run([str(binary)],cwd=tmp,check=True,timeout=30)
+
+with tempfile.TemporaryDirectory(prefix='d3d12-shader-cache-') as tmp:
+    binary=Path(tmp)/'test.exe'
+    subprocess.run([os.environ.get('CC','clang-cl'),'/nologo','/W0','/UNDEBUG',
+                    '/I'+str(root/'libs/video'),str(root/'libs/video/tests/test_d3d12_shader_cache.c'),
+                    '/Fe:'+str(binary)],cwd=tmp,env=environ(),check=True)
+    subprocess.run([str(binary)],cwd=tmp,check=True,timeout=30)
+
+with tempfile.TemporaryDirectory(prefix='vertex-float-plan-') as tmp:
+    binary=Path(tmp)/'test.exe'
+    subprocess.run([os.environ.get('CC','clang-cl'),'/nologo','/W0','/UNDEBUG',
+                    '/I'+str(root/'include'),'/I'+str(root/'libs/video'),
+                    str(root/'libs/video/tests/test_vertex_float_plan.c'),str(root/'libs/video/rsx_vertex_fetch.c'),
+                    '/Fe:'+str(binary)],cwd=tmp,env=environ(),check=True)
     subprocess.run([str(binary)],cwd=tmp,check=True,timeout=30)

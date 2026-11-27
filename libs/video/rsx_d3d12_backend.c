@@ -46,6 +46,10 @@
 #include <dxgi1_4.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#include "rsx_vertex_float_plan.h"
+#include "rsx_d3d12_shader_cache.h"
+#include "rsx_d3d12_null_srv.h"
+#define D3DCompile rsx_d3d12_compile_cached
 
 /* Link libraries */
 #pragma comment(lib, "d3d12.lib")
@@ -397,6 +401,7 @@ typedef struct {
     int                   frame_recording; /* 1 if cmd list is open for recording */
     u32                   draw_count;      /* draws this frame */
     D3D12DrawRecord       draws[MAX_DRAWS];
+    rsx_d3d12_null_srv null_srv[SRV_HEAP_SIZE];
 
     /* Pointer to current RSX state (set before draw calls) */
     const rsx_state*      current_rsx_state;
@@ -4009,6 +4014,12 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
 static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
                          UINT mapping, int cube)
 {
+    /* Only this function writes the per-draw window. Non-null writes invalidate
+     * the remembered null view; resource identity/lifetime is never assumed. */
+    static int no_null_cache=-1;
+    if(no_null_cache<0)no_null_cache=getenv("RSX_D3D12_NULL_SRV_CACHE_DISABLE")?1:0;
+    if(!no_null_cache && heap_slot>=DRAW_SRV_BASE && heap_slot<SRV_HEAP_SIZE &&
+       rsx_d3d12_null_srv_reuse(&s_d3d.null_srv[heap_slot],res!=NULL,(u32)fmt,mapping,cube))return;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -6056,6 +6067,7 @@ static int d3d12_init(void* ud, u32 width, u32 height)
 
 static void d3d12_shutdown(void* ud)
 {
+    rsx_dxbc_clear();
     (void)ud;
     printf("[D3D12] Backend shutdown\n");
 }
@@ -6490,14 +6502,20 @@ static void vs_arrays(const rsx_state* st, u32 prim, u32 count)
 /* The FIFO records draws serially. Build the input list once per draw. */
 static unsigned s_vp_active_count;
 static u8 s_vp_active_slots[16];
+static rsx_vertex_float_plan s_vp_float_plan[16];
 
 static void vp_begin_vertex_fetch(const rsx_state* state)
 {
     s_vp_active_count = 0;
+    memset(s_vp_float_plan,0,sizeof s_vp_float_plan);
     if (!state) return;
+    static int disabled=-1;
+    if(disabled<0)disabled=getenv("RSX_VERTEX_FLOAT_PLAN_DISABLE") || getenv("VTX_TYPEDBG");
     for (unsigned slot = 0; slot < 16; ++slot) {
-        if (state->vertex_attribs[slot].enabled)
+        if (state->vertex_attribs[slot].enabled) {
             s_vp_active_slots[s_vp_active_count++] = (u8)slot;
+            if(!disabled)rsx_vertex_float_prepare(state,slot,&s_vp_float_plan[slot]);
+        }
     }
 }
 
@@ -6508,7 +6526,9 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
     memcpy(converted, state->vertex_data4f, sizeof(converted));
     for (unsigned i = 0; i < s_vp_active_count; ++i) {
         unsigned slot = s_vp_active_slots[i];
-        rsx_fetch_enabled_attrib(state, slot, vi, converted[slot].v);
+        if(s_vp_float_plan[slot].enabled)
+            rsx_vertex_float_fetch(&s_vp_float_plan[slot],vi,converted[slot].v);
+        else rsx_fetch_enabled_attrib(state, slot, vi, converted[slot].v);
     }
     const rsx_vertex_attrib* position = &state->vertex_attribs[0];
     u32 n = position->size ? position->size : 4;
