@@ -910,7 +910,7 @@ static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
 static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
 static SRWLOCK s_spurs_queue_lock = SRWLOCK_INIT;
-static u32 s_spurs_port_queue[64];
+static u8 s_spurs_queue_port[MAX_SPURS_QUEUES];
 
 /* Release anyone blocked on the completion queues SPURS attached; see
  * cellSpursFinalize. */
@@ -924,12 +924,11 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
         u32 owner = s_spurs_event_queue_owner[i];
         if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
             u32 q = s_spurs_event_queue[i];
-            for (u32 p = 0; p < 64; p++)
-                if (s_spurs_port_queue[p] == q) s_spurs_port_queue[p] = 0;
             sys_event_queue_cancel_by_id(q);
         } else {
             s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
             s_spurs_event_queue_owner[keep] = owner;
+            s_spurs_queue_port[keep] = s_spurs_queue_port[i];
             keep++;
         }
     }
@@ -945,59 +944,49 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
  * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
  * stalls on the first physics step that way (port 2), and the PPU step waits
  * for it forever. */
+static int port_binding(u32 owner, u32 port)
+{
+    for (int i = 0; i < s_spurs_event_queue_n; ++i)
+        if (s_spurs_queue_port[i] == port && (!owner || s_spurs_event_queue_owner[i] == owner))
+            return i;
+    return -1;
+}
+
 uint32_t spurs_port_queue(uint32_t port)
 {
     AcquireSRWLockShared(&s_spurs_queue_lock);
-    u32 q = port < 64 ? s_spurs_port_queue[port] : 0;
+    int i = port_binding(0, port);
+    u32 q = i < 0 ? 0 : s_spurs_event_queue[i];
     ReleaseSRWLockShared(&s_spurs_queue_lock);
     return q;
 }
 
-s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
-                                 s32 isDynamic)
+s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDynamic)
 {
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    u32 owner = (u32)(uintptr_t)spurs;
+    u8* out = GUEST_PTR(port, u8*);
+    u32 p = *out;
+    if (!queue || (!isDynamic && p >= 64)) return CELL_SPURS_CORE_ERROR_INVAL;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    /* KEEP the queue id. SPURS signals the application through the queue it
-     * attaches here, and this discarded it -- so nothing SPURS ever did could
-     * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
-     * kicks its job chain and then blocks on exactly that receive. */
-    if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
-        /* A previous cellSpursFinalize may have cancelled this queue. Attaching
-         * gives it a producer again, so lift that -- otherwise a title that
-         * tears its audio down and brings it back finds every receive failing. */
-        sys_event_queue_uncancel_by_id(queue);
-        int dup = 0;
-        for (int i = 0; i < s_spurs_event_queue_n; i++)
-            if (s_spurs_event_queue[i] == queue) dup = 1;
-        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
-                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
-    }
-
-    u8* port_h = GUEST_PTR(port, u8*);
-
-    /* Static: the caller names the port in *port. Dynamic: pick a free one,
-     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
-     * and hand it back. This used to write 0 either way, so every attach
-     * landed on port 0 and the SPU's real port number routed nowhere. */
-    u32 p = *port_h;
     if (isDynamic) {
-        p = 64;
-        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
-        if (p == 64) { ReleaseSRWLockExclusive(&s_spurs_queue_lock); return CELL_SPURS_CORE_ERROR_BUSY; }
-        *port_h = (u8)p;
-    } else if (p >= 64) {
-        ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-        return CELL_SPURS_CORE_ERROR_INVAL;
-    } else if (s_spurs_port_queue[p]) {
+        for (u32 i = 0; i < 64; ++i) {
+            p = (16 + i) % 64;
+            if (port_binding(owner, p) < 0) break;
+        }
+    }
+    if (s_spurs_event_queue_n == MAX_SPURS_QUEUES || port_binding(owner, p) >= 0) {
         ReleaseSRWLockExclusive(&s_spurs_queue_lock);
         return CELL_SPURS_CORE_ERROR_BUSY;
     }
-    s_spurs_port_queue[p] = queue;
-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
-           isDynamic ? " (dynamic)" : "");
+    int i = s_spurs_event_queue_n++;
+    s_spurs_event_queue[i] = queue;
+    s_spurs_event_queue_owner[i] = owner;
+    s_spurs_queue_port[i] = (u8)p;
+    sys_event_queue_uncancel_by_id(queue);
+    *out = (u8)p;
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+    printf("[cellSpurs] AttachLv2EventQueue(owner=0x%08X queue=%u port=%u)\n",owner,queue,p);
     return CELL_OK;
 }
 
@@ -1005,9 +994,14 @@ s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     AcquireSRWLockExclusive(&s_spurs_queue_lock);
-    if (port < 64) s_spurs_port_queue[port] = 0;
+    int i = port_binding((u32)(uintptr_t)spurs, port);
+    if (i >= 0) {
+        int last = --s_spurs_event_queue_n;
+        s_spurs_event_queue[i] = s_spurs_event_queue[last];
+        s_spurs_event_queue_owner[i] = s_spurs_event_queue_owner[last];
+        s_spurs_queue_port[i] = s_spurs_queue_port[last];
+    }
     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-    printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
     return CELL_OK;
 }
 
