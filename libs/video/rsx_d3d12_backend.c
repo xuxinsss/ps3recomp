@@ -2350,6 +2350,23 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+/* Keep the existing 4 KiB fast scan for ordinary programs. If END is not
+ * found, extend to the live draw engine's 64 KiB ceiling, bounded by the
+ * committed host region. Never compile a truncated prefix. */
+static u32 d3d12_fp_program_size(u32 off)
+{
+    extern uint8_t* vm_base;
+    const u8* ptr = vm_base + off;
+    const u32 short_size = rsx_fp_program_size(ptr, 4096);
+    if (short_size) return short_size;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(ptr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+    SIZE_T available = mbi.RegionSize - (SIZE_T)(ptr - (const u8*)mbi.BaseAddress);
+    if (available > RSX_D3D12_FP_MAX_BYTES) available = RSX_D3D12_FP_MAX_BYTES;
+    return rsx_fp_program_size(ptr, (u32)available);
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
                                           u32 cube_mask, u64 zs, u32* sampled_units)
@@ -2380,10 +2397,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* Hash the CODE, not the constants: with fp_k[] hoisted into the per-draw
      * constant buffer the compiled shader is invariant under constant changes,
      * so hashing them made the pipeline key move every draw. */
+    const u32 usz = d3d12_fp_program_size(off);
+    if (!usz) return NULL;
     u32 uhash;
     {
-        u32 usz = rsx_fp_program_size(vm_base + off, 4096);
-        if (usz == 0) usz = 64;
         s_perf_pso_hashbytes += (int)usz;
         static int consts_inline = -1;
         if (consts_inline < 0) { const char* e = getenv("FP_CONSTBUF");
@@ -2393,7 +2410,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
         } else {
-            uhash = rsx_fp_code_hash(vm_base + off, 4096);
+            uhash = rsx_fp_code_hash(vm_base + off, usz);
         }
     }
 
@@ -2479,7 +2496,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
-    int n = rsx_fp_decompile_d3d12(vm_base + off, 4096, fp_ctrl, cube_mask, hlsl, sizeof(hlsl));
+    int n = rsx_fp_decompile_d3d12(vm_base + off, usz, fp_ctrl, cube_mask, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
@@ -2782,7 +2799,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
         s_d3d.vp_fp_n = VP_FP_CACHE - 1;
     }
-    const u32 units = rsx_fp_texture_units(vm_base + off, 4096);
+    const u32 units = rsx_fp_texture_units(vm_base + off, usz);
     s_d3d.vp_fp[s_d3d.vp_fp_n].sampled_units = units;
     if (sampled_units) *sampled_units = units;
     s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
@@ -3576,8 +3593,10 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             extern u32 cellGcmResolveLocated(int, u32);
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
-            if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 128);
+            if (vm_base && foff != 0xFFFFFFFFu) {
+                const u32 size = d3d12_fp_program_size(foff);
+                if (size) rsx_fp_extract_consts(vm_base + foff, size, &ts[20], 128);
+            }
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the

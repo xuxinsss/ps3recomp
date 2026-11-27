@@ -101,8 +101,8 @@ int main(int argc,char**argv)
     if(be32(q)==1069 && unit<16)cube|=1u<<unit;
    }
    unsigned ctrl=(p[program+19]?0:0x40)|(p[program+20]?0xe:0);
-   /* Match the legacy runtime's current decoder bound exactly. */
-   if(rsx_fp_decompile_d3d12(p+ucode,size>4096?4096:size,ctrl,cube,text,sizeof text)<=0){++failed;continue;}
+   /* The parser has validated the complete microcode range. */
+   if(rsx_fp_decompile_d3d12(p+ucode,size,ctrl,cube,text,sizeof text)<=0){++failed;continue;}
    prepare(text,"ps_5_0");
   }
   if(handled%5==0){printf("[precompile worker %u] programs=%u prepared=%u failures=%u elapsed=%.1fs\n",worker,handled,prepared,failed,(GetTickCount64()-start)/1000.0);fflush(stdout);}

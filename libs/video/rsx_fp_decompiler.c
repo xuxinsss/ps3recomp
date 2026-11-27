@@ -127,7 +127,8 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
         if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
             ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
             ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
-            if (off + 16 <= max_bytes) off += 16;
+            if (off + 16 > max_bytes) return 0;
+            off += 16;
         }
         if (w0 & FP_END) return off;
     }
@@ -1478,7 +1479,10 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
 int rsx_fp_decompile_d3d12(const u8* ucode, u32 max_bytes, u32 ctrl,
                            u32 tex_cube_mask, char* out, u32 out_size)
 {
-    return rsx_fp_decompile_internal(ucode, max_bytes, ctrl, tex_cube_mask,
+    if (max_bytes > RSX_D3D12_FP_MAX_BYTES) max_bytes = RSX_D3D12_FP_MAX_BYTES;
+    const u32 size = rsx_fp_program_size(ucode, max_bytes);
+    if (!size) { if (out && out_size) out[0] = 0; return -1; }
+    return rsx_fp_decompile_internal(ucode, size, ctrl, tex_cube_mask,
         0, 2, NULL, NULL, NULL, out, out_size, NULL);
 }
 

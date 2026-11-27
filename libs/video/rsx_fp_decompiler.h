@@ -19,6 +19,8 @@ extern "C" {
 #endif
 
 #define RSX_FP_BUFFERED_CONSTANTS_API 1
+/* Legacy D3D12 scan ceiling, shared with its offline cache preparation. */
+#define RSX_D3D12_FP_MAX_BYTES 0x10000u
 #define RSX_FP_MAX_INLINE_CONSTANTS 2048u
 
 /* Source capacity for native backends decoding up to 4096 bytecode bytes.
