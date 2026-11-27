@@ -68,6 +68,10 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
 
+/* Array-only fetch for callers that prefilled the constant register and
+ * already checked that the array is enabled. */
+void rsx_fetch_enabled_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
+
 #ifdef __cplusplus
 }
 #endif

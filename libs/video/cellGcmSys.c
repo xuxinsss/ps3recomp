@@ -1379,6 +1379,14 @@ static void nv3089_blit(void)
                      s_nv309e.active, 10);
           }
       } }
+    rsx_backend* copy_backend = rsx_get_backend();
+    if (copy_backend && copy_backend->surface_copy &&
+        s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+        in_pitch == dst_pitch && s_nv3089.in_uv == 0 && s_nv3089.out_pt == 0 &&
+        !s_nv309e.active && s_nv3089.src_dma == 0xFEED0000u &&
+        s_gcm2d.dst_dma == 0xFEED0000u && (s_nv3089.fmt & 255) == 3)
+        copy_backend->surface_copy(s_nv3089.in_off, s_gcm2d.dst_offset,
+                                   in_pitch, out_w, out_h);
     /* A copy out of a surface the live renderer drew exists only on the GPU;
      * mirror 1:1 blits there too (the guest-memory copy below still runs). */
     if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
@@ -3390,6 +3398,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
     const u32 back_jumps0 = s_fifo_back_jumps;
+    u32 tail_put = 0xFFFFFFFFu;
+    s_fifo_recycle_waiting = 1;
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -3397,7 +3407,13 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * may observe the new `put`, find `get` != `put`, and read the old
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
-        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+        /* If GET is already at begin, publishing begin would describe an
+         * empty queue. Publish the filled tail first; once GET reaches the
+         * jump, publish its destination to let the walker consume it. */
+        if (vm_read32(GCM_CONTROL_GUEST_ADDR + 4) == io_begin)
+            tail_put = gcm_ea2io(current);
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0,
+                   tail_put == 0xFFFFFFFFu ? io_begin : tail_put);
     }
 
     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
@@ -3414,9 +3430,12 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * 60 s caps the whole thing. */
     int spins = 0, idle = 0;
     u32 last_get = s_fifo_getoff;
-    s_fifo_recycle_waiting = 1;
     while (io_begin != 0xFFFFFFFFu && s_fifo_back_jumps == back_jumps0 &&
            idle < 2000 && spins < 60000) {
+        if (tail_put != 0xFFFFFFFFu && vm_read32(GCM_CONTROL_GUEST_ADDR + 4) == tail_put) {
+            vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);
+            tail_put = 0xFFFFFFFFu;
+        }
         Sleep(1); spins++;
         if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
         else idle++;
@@ -3432,6 +3451,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                    g_gcm_fifo_drained_ea, begin, spins);
     }
 
+    if (tail_put != 0xFFFFFFFFu) vm_write32(GCM_CONTROL_GUEST_ADDR, io_begin);
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
     s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
 
