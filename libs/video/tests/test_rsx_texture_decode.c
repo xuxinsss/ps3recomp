@@ -170,6 +170,67 @@ static void texture_decode_dynamic_inputs(void)
     engine_down();
 }
 
+
+/* Exercise the opt-in material rule through real register decoding and the
+ * backend binding contract, including FP switches with identical shader code. */
+static rsx_be_sampler_desc material_samplers[RSX_BE_MAX_TEXTURES];
+static void material_bind(void* user, const u32* textures,
+                          const rsx_be_sampler_desc* samplers, u32 mask)
+{
+    memcpy(material_samplers, samplers, sizeof material_samplers);
+    stub_bind_textures(user, textures, samplers, mask);
+}
+static void material_wrap_case(const char* rule, u32 fp_raw, u32 texture,
+                                u32 unit, u32 expected_u, const char* label)
+{
+    if (rule) setenv("RSX_WRAP_U_FP", rule, 1); else unsetenv("RSX_WRAP_U_FP");
+    rsx_draw_backend be = g_stub_backend;
+    be.bind_textures = material_bind;
+    memset(material_samplers, 0, sizeof material_samplers);
+    engine_up_with(&be);
+    bind_texture_unit(RSX_LOCATION_MAIN, texture);
+    m(M_TEX_UNIT + 0x08, 0x00050303u); /* S/T clamp, R mirrored repeat */
+    if (unit) {
+        const u32 at = M_TEX_UNIT + unit * 32u;
+        m(at + 0x00, texture);
+        m(at + 0x04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+        m(at + 0x08, 0x00050303u);
+        m(at + 0x0C, 0x80000000u);
+        m(at + 0x10, 0xAAE4u);
+        m(at + 0x18, (4u << 16) | 4u);
+    }
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; i++) { u32 word; memcpy(&word, vp + i * 4, 4); m(0xB80 + i * 4, word); }
+    m(0x1EA0, 0);
+    rsx_test_fp_tex_r0_tc0(vm_base + (fp_raw & ~3u), unit);
+    m(0x08E4, fp_raw);
+    m(0x1D60, 0x40u);
+    draw_triangle();
+    CHECK((stub.bound_mask & (1u << unit)) && material_samplers[unit].wrap_s == expected_u,
+          "material override %s reaches selected U sampler", label);
+    CHECK(material_samplers[unit].wrap_t == 3 && material_samplers[unit].wrap_r == 5,
+          "material override %s leaves V/W alone", label);
+    rsx_dsp_texture original;
+    rsx_draw_engine_test_get_texture(unit, &original);
+    CHECK(original.wrap == 0x00050303u,
+          "material override %s preserves guest registers and decode cache", label);
+    engine_down();
+}
+static void material_wrap_regressions(void)
+{
+    material_wrap_case(NULL, 0x30002u, TEX_OFFSET, 0, 3, "unset");
+    material_wrap_case("0", 0x30002u, TEX_OFFSET, 0, 3, "disabled");
+    material_wrap_case("30002,20000", 0x30002u, TEX_OFFSET, 0, 1, "exact match");
+    material_wrap_case("30002,20000", 0x30012u, TEX_OFFSET, 0, 3, "different program");
+    material_wrap_case("30001,20000", 0x30002u, TEX_OFFSET, 0, 3, "FP location bits");
+    material_wrap_case("30002,20000", 0x30002u, TEX_OFFSET + 0x1000u, 0, 3, "different texture");
+    material_wrap_case("30002,20000", 0x30002u, TEX_OFFSET, 1, 3, "different unit");
+    material_wrap_case("30002,20000junk", 0x30002u, TEX_OFFSET, 0, 3, "malformed rule");
+    unsetenv("RSX_WRAP_U_FP");
+}
+
 static double seconds(void)
 {
     struct timespec t;
@@ -219,7 +280,7 @@ int main(int argc, char** argv)
             for (int mode = 0; mode < 3; mode++)
                 benchmark(draws, changing, (mode + repeat) % 3);
         }
-    } else { texture_decode_equivalence(); texture_decode_dynamic_inputs(); }
+    } else { texture_decode_equivalence(); texture_decode_dynamic_inputs(); material_wrap_regressions(); }
     free(vm_base);
     return g_failures ? 1 : 0;
 }

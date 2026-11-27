@@ -195,6 +195,9 @@ static struct {
     int ready;
     int default_on;
     u32 width, height;
+    /* Opt-in material override, including the FP location bits. */
+    u32 wrap_u_fp, wrap_u_texture;
+    int wrap_u_reported;
 
     rsx_dispatch rsx;
     rsx_dsp_texture decoded_textures[RSX_DSP_NUM_TEXTURES];
@@ -3043,7 +3046,20 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          * aliased surface a store to guest memory, for nothing. */
         if (!t.enabled || !((tex_used >> u) & 1u)) continue;
         mask |= 1u << u;
-        eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
+        /* Preserve the guest registers/decode cache. Apply the optional
+         * material rule before the backend picks/caches its sampler. Match
+         * the full SET_SHADER_PROGRAM value, not the masked ucode offset. */
+        u32 wrap = t.wrap;
+        if (g.wrap_u_fp && u == 0 && t.offset == g.wrap_u_texture &&
+            rsx_dsp_reg(&g.rsx, 0x08E4) == g.wrap_u_fp) {
+            wrap = (wrap & ~15u) | 1u;   /* RSX REPEAT on U only */
+            if (!g.wrap_u_reported) {
+                fprintf(stderr, "[rsx engine] RSX_WRAP_U_FP matched fp=0x%08X texture=0x%08X unit=0 U=%u->1\n",
+                        g.wrap_u_fp, g.wrap_u_texture, t.wrap & 15u);
+                g.wrap_u_reported = 1;
+            }
+        }
+        eng_decode_sampler(t.filter, wrap, t.control0, &samplers[u]);
         samplers[u].border = eng_border_class(t.format, t.border_color);
 
         int sampled = -1, own = 0, surface_at = -1;
@@ -4108,6 +4124,17 @@ int rsx_draw_engine_init(u32 width, u32 height)
     if (!g.be) return -1;
     g.width  = width  ? width  : 1280;
     g.height = height ? height : 720;
+    g.wrap_u_fp = g.wrap_u_texture = 0;
+    g.wrap_u_reported = 0;
+    { const char* e = getenv("RSX_WRAP_U_FP");
+      u32 fp = 0, texture = 0; char extra;
+      if (e && *e && strcmp(e, "0") != 0) {
+          if (sscanf(e, "%x,%x %c", &fp, &texture, &extra) == 2 && fp) {
+              g.wrap_u_fp = fp; g.wrap_u_texture = texture;
+          } else {
+              fprintf(stderr, "[rsx engine] invalid RSX_WRAP_U_FP; expected hex-FP,hex-texture\n");
+          }
+      } }
     { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
       s_texhash_full_always = e && *e && strcmp(e, "0") != 0; }
     { const char* e = getenv("PS3RECOMP_ENG_DEPTH_VIA_GUEST");
