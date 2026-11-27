@@ -26,4 +26,3 @@ with tempfile.TemporaryDirectory(prefix='spurs-owner-ports-') as directory:
                    '-pthread', '-o', str(binary)]
     subprocess.run(command, cwd=temp, env=env, check=True)
     subprocess.run([str(binary)], cwd=temp, check=True, timeout=15)
-

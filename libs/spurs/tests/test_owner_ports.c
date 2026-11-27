@@ -30,4 +30,3 @@ int main(void) {
  puts("PASS: per-instance static/dynamic ports, duplicate rejection, detach and owner cancellation");
  free(vm_base); return 0;
 }
-
