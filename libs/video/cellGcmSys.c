@@ -3057,7 +3057,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 if (wdiag) { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  /* Only the 3D route below may feed NV4097 state. 2D
+                   * objects reuse method offsets (e.g. 0x0304 pitch/point
+                   * aliases ALPHA_TEST_ENABLE); canonicalising their
+                   * subchannel inside the draw engine corrupts 3D state.
+                   * Preserve the driver-method address bank as before. */
+                  const u32 full_method = (subch << 13) | m;
+                  if (eng && (subch == 0 || (subch == 1 && !s1_2d) ||
+                              full_method >= 0xE000u))
+                      rsx_draw_engine_method(full_method, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
