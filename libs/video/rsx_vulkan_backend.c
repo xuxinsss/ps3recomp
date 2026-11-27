@@ -3045,6 +3045,17 @@ static int vk_pt_stage(void* user, uint32_t slot, uint32_t surface)
     return 1;
 }
 
+#ifdef _WIN32
+/* The present-thread Windows stub has no clock; Vulkan hooks still compile. */
+static uint64_t rsx_present_thread_now(void)
+{
+    LARGE_INTEGER count, frequency;
+    QueryPerformanceCounter(&count);
+    QueryPerformanceFrequency(&frequency);
+    return (uint64_t)(count.QuadPart / frequency.QuadPart) * 1000000000ull
+         + (uint64_t)(count.QuadPart % frequency.QuadPart) * 1000000000ull / frequency.QuadPart;
+}
+#endif
 static int vk_pt_show(void* user, uint32_t slot, rsx_present_show_timing* timing)
 {
     (void)user;
