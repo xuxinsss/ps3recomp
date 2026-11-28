@@ -977,7 +977,7 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDy
     u64 generation = sys_event_queue_generation(queue);
     if (!generation) {
         ReleaseSRWLockExclusive(&s_spurs_queue_lock);
-        return CELL_SPURS_CORE_ERROR_SRCH;
+        return (s32)CELL_ESRCH; /* propagate the missing LV2 queue status */
     }
     if (isDynamic) {
         for (u32 i = 0; i < 64; ++i) {

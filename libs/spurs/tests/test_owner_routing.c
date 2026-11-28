@@ -379,7 +379,7 @@ int main(int argc, char **argv) {
   } else if (!strcmp(mode, "invalid-queue")) {
     vm_base[0x100] = 7;
     CHECK(cellSpursAttachLv2EventQueue((CellSpurs *)(uintptr_t)a, SYS_EVENT_QUEUE_MAX + 1,
-        (u8 *)(uintptr_t)0x100, 1) == CELL_SPURS_CORE_ERROR_SRCH);
+        (u8 *)(uintptr_t)0x100, 1) == (s32)CELL_ESRCH);
     CHECK(vm_base[0x100] == 7 && s_spurs_event_queue_n == 0);
   } else if (!strcmp(mode, "stale-uncancel")) {
     uint64_t old = sys_event_queue_generation(q1);
