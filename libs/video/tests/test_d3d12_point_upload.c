@@ -1,15 +1,14 @@
-/* The legacy D3D12 path's draw-drop and flip counters, with no device: draws
- * reach the backend before its pipeline is up, with a bad vertex count and
- * without vertex-program resources, and each is counted by reason.
- * D3D12_DROP_STATS_EVERY=<n> prints the line on the nth flip; unset, nothing
- * is printed. No window, GPU, guest memory or game data.
- * python3 tools/test_d3d12_drop_stats.py */
+/* Point register decoding, six-vertex upload and per-draw viewport constants
+ * through the actual legacy D3D12 backend. Synthetic guest vertices only;
+ * no device, window or title data. GPU coverage is tested separately.
+ * python tools/test_d3d12_point_upload.py */
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
 #include "../rsx_d3d12_backend.c"
 
-/* The fixture has no guest: none of these may be reached on its paths. */
+/* Only local synthetic vertex offsets are resolved; all other guest services
+ * fail if unexpectedly called. */
 u8* vm_base; u32 ppu_vm_size, ppu_hle_inject_base;
 static void no_guest(const char* what) { fprintf(stderr, "FAIL fixture reached guest-side %s\n", what); exit(1); }
 CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index) { (void)index; no_guest("display buffers"); return NULL; }
