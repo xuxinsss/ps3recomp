@@ -88,10 +88,11 @@ static Lit draw_point(float reg, u32 mask, float vp_size, u32 control, u32 aa, i
                     if (y > r.maxy) r.maxy = y;
                 }
         if (coords && (control & 0x101u) == 0x101u) {
-            const u8* left = (const u8*)&px[(h/2)*w + w/2 - 1];
-            const u8* right = (const u8*)&px[(h/2)*w + w/2 + 1];
+            const u32 midy = (r.miny + r.maxy) / 2;
+            const u8* left = (const u8*)&px[midy*w + r.minx];
+            const u8* right = (const u8*)&px[midy*w + r.maxx];
             CHECK(left[0] < right[0] && left[2] == 255 && right[2] == 255,
-                  "selected TC0 has a horizontal PointCoord gradient");
+                  "selected TC0 has a horizontal PointCoord gradient (%u -> %u, coverage blue %u/%u)", left[0],right[0],left[2],right[2]);
         } else if (coords) {
             const u8* centre = (const u8*)&px[(h/2)*w + w/2];
             CHECK(centre[0] == 255 && centre[1] == 0,
