@@ -1609,6 +1609,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    rsx_vp_set_epilogue_branch_bits(vpx, st->transform_branch_bits);
     float* point = (float*)(vpc + (RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u);
     point[0] = 1.0f; point[1] = (st->vertex_attrib_output_mask & RSX_VP_OUTPUT_MASK_POINT_SIZE) ? 1.0f : 0.0f;
     point[2] = s_vk.point_size_max < RSX_VP_POINT_SIZE_MAX ? s_vk.point_size_max : RSX_VP_POINT_SIZE_MAX; point[3] = 1.0f;
