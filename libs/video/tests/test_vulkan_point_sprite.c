@@ -87,8 +87,8 @@ static Lit draw_point(float reg, u32 mask, float vp_size, u32 control, u32 aa, i
                     if (y > r.maxy) r.maxy = y;
                 }
         if (coords && (control & 0x101u) == 0x101u) {
-            const u8* left = (const u8*)&px[(h/2)*w + w/2 - 2];
-            const u8* right = (const u8*)&px[(h/2)*w + w/2 + 2];
+            const u8* left = (const u8*)&px[(h/2)*w + w/2 - 1];
+            const u8* right = (const u8*)&px[(h/2)*w + w/2 + 1];
             CHECK(left[0] < right[0] && left[0] > 0 && right[0] < 255,
                   "selected TC0 has a horizontal PointCoord gradient");
         } else if (coords) {
@@ -122,6 +122,7 @@ int main(void)
     Lit c=draw_point(8,0x20,3,0,0,0); CHECK(is_square(&c,3), "VP size overrides register: 3x3 (%u lit)",c.lit);
     Lit d=draw_point(5000,0,3,0,0,0); CHECK(is_square(&d,64), "guest ceiling: 64x64 (%u lit)",d.lit);
     Lit e=draw_point(8,0,3,0x101,0,1); CHECK(is_square(&e,8), "selected coordinates: 8x8 (%u lit)",e.lit);
+    Lit odd=draw_point(3,0,3,0x101,0,1); CHECK(is_square(&odd,3), "odd-sized selected coordinates: 3x3 (%u lit)",odd.lit);
     Lit f=draw_point(8,0,3,0x100,0,1); CHECK(is_square(&f,8), "sprite disabled: 8x8 (%u lit)",f.lit);
     Lit h=draw_point(8,0,3,0x1001,0,1); CHECK(is_square(&h,8), "unselected TC0: 8x8 (%u lit)",h.lit);
     Lit i=draw_point(8,0,3,0x101,3,1); CHECK(i.lit==128 && i.maxx-i.minx+1==16 && i.maxy-i.miny+1==8, "2x1 sample grid: 16x8 (%u lit)",i.lit);

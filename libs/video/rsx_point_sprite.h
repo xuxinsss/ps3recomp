@@ -43,7 +43,7 @@ static inline int rsx_point_sprite_patch(char* s, size_t cap, unsigned key)
     int n = snprintf(prefix, sizeof prefix,
         "\n#ifdef RSX_POINT_COORD_BUILTIN\n"
         "    float2 _rsx_sprite_uv = (input._rsx_sprite_point - 0.5) / max(fp_pointgrid.xy, float2(0.000001,0.000001)) + 0.5;\n"
-        "    if (any(_rsx_sprite_uv < 0.0) || any(_rsx_sprite_uv > 1.0)) discard;\n");
+        "    if ((fp_pointgrid.x < 1.0 && (_rsx_sprite_uv.x < 0.0 || _rsx_sprite_uv.x > 1.0)) || (fp_pointgrid.y < 1.0 && (_rsx_sprite_uv.y < 0.0 || _rsx_sprite_uv.y > 1.0))) discard;\n");
     if (n < 0 || (size_t)n >= sizeof prefix) return -1;
     for (unsigned u = 0; u < 10; ++u) {
         if (!(key & (1u << u))) continue;
