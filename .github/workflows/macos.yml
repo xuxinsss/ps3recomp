@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [default, load, background, interactive]
+        profile: [paired]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -23,7 +23,12 @@ jobs:
       - name: Measure unchanged assertions and runtime exit stages
         env:
           CI: '1'
-        run: python diagnostic_prio_rootcause.py '${{ matrix.profile }}'
+        run: |
+          for profile in background background-guest-spin background-poll-spin background-both-spin background-both-spin-mutant background; do
+            if [ -d "prio-evidence/$profile" ]; then mv "prio-evidence/$profile" "prio-evidence/$profile-first"; fi
+            ORIGINAL_CASES=0 TRACE_CASES=24 python diagnostic_prio_rootcause.py "$profile"
+          done
+          find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 -name '*.ips' -mmin -15 -exec cp '{}' prio-evidence/ \; || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

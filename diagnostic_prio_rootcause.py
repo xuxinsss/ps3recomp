@@ -12,6 +12,10 @@ header=r'''
 #include <stdatomic.h>
 #include <string.h>
 #include <sched.h>
+#include <signal.h>
+#include <execinfo.h>
+#include <unistd.h>
+static void fault(int sig,siginfo_t* si,void* uc) {(void)uc;void* bt[32];fprintf(stderr,"DIAG_SIGNAL sig=%d code=%d addr=%p\n",sig,si->si_code,si->si_addr);int n=backtrace(bt,32);backtrace_symbols_fd(bt,n,2);_Exit(128+sig);}
 enum {D_CREATE,D_WAIT,D_ENTRY,D_SLEEP_BEGIN,D_SLEEP_END,D_PUBLISH,D_RETURN,D_LOG_DONE,D_LOCK_BEGIN,D_LOCK_END,D_FREE,D_OBSERVE,D_CREATE_END,D_COUNT};
 static _Atomic long long dt[65][D_COUNT];
 static _Atomic long long max_nap[65],nap_sum[65],nap_n[65],nap_at[65];
@@ -22,6 +26,7 @@ static void reason(unsigned id,int why) {mark(id,D_OBSERVE);atomic_store(&dr[id]
 static void nap(unsigned id,long long begin) {long long elapsed=dns()-begin;if(id<65){atomic_fetch_add(&nap_sum[id],elapsed);atomic_fetch_add(&nap_n[id],1);if(elapsed>atomic_load(&max_nap[id])){atomic_store(&max_nap[id],elapsed);atomic_store(&nap_at[id],begin);}}}
 static int get_qos(void) {qos_class_t q;int rel;int rc=pthread_get_qos_class_np(pthread_self(),&q,&rel);return rc ? -rc : (int)q;}
 static void setup_profile(void) {
+ setvbuf(stdout,NULL,_IONBF,0);struct sigaction sa={0};sa.sa_sigaction=fault;sa.sa_flags=SA_SIGINFO;sigaction(SIGBUS,&sa,NULL);sigaction(SIGSEGV,&sa,NULL);
  const char *p=getenv("DIAG_QOS");int rc=0;
  if(p && !strcmp(p,"background"))rc=pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND,0);
  if(p && !strcmp(p,"interactive"))rc=pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
@@ -57,6 +62,12 @@ source=source.replace('        __atomic_store_n(&g_published, 1, __ATOMIC_RELAXE
 source=once(source,'    const long long t0 = now_ms();','    const long long diag_begin = dns();\n    const long long t0 = now_ms();')
 source=once(source,'    return now_ms() - t0;','    const long long elapsed = now_ms() - t0;\n    dump(__builtin_bswap64(*(uint64_t*)(vm_base+0x100)),body,diag_begin,dns());\n    return elapsed;')
 source=once(source,'    const int on = getenv("PS3_PRIO_START") != NULL;','    setup_profile();\n    const int on = getenv("PS3_PRIO_START") != NULL;')
+if 'guest-spin' in profile or 'both-spin' in profile:
+ source=source.replace('sleep_ms(PUBLISH_DELAY_MS);mark(ctx->thread_id,D_SLEEP_END);','{long long until=dns()+PUBLISH_DELAY_MS*1000000LL;while(dns()<until)sched_yield();}mark(ctx->thread_id,D_SLEEP_END);')
+if 'poll-spin' in profile or 'both-spin' in profile:
+ runtime=once(runtime,'Sleep(1);nap(tid,nb);','sched_yield();nap(tid,nb);')
+if 'mutant' in profile:
+ runtime=once(runtime,'if (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE) {reason(tid,2); return;}','if (0 && (state == PPU_THREAD_STATE_FINISHED || state == PPU_THREAD_STATE_FREE)) {reason(tid,2); return;}')
 loads=[];results=[]
 try:
  with tempfile.TemporaryDirectory(prefix='prio-rootcause-') as tmp:
@@ -68,15 +79,15 @@ try:
   (tmp/'original.c').write_text(wrapper)
   binaries={}
   for name,src in [('original',root/'tests/test_ppu_prio_start.c' if profile in ('default','load') else tmp/'original.c'),('trace',tmp/'trace.c')]:
-   binary=tmp/name;cmd=['clang','-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections','-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),str(src),'-Wl,-dead_strip','-o',str(binary)]
+   binary=tmp/name;cmd=['clang','-std=gnu17','-D_GNU_SOURCE','-O1','-g','-UNDEBUG','-ffunction-sections','-fdata-sections','-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),str(src),'-Wl,-dead_strip','-o',str(binary)]
    subprocess.run(cmd,check=True);binaries[name]=binary
   (out/'instrumented-runtime.c').write_text(runtime);(out/'instrumented-fixture.c').write_text(source);(out/'diag.h').write_text(header)
   if profile=='load':
    for _ in range(min(12,2*(os.cpu_count() or 2))):loads.append(subprocess.Popen([sys.executable,'-c','while True: pass'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
    time.sleep(1)
-  for variant,count in [('original',20),('trace',60)]:
+  for variant,count in [('original',int(os.environ.get('ORIGINAL_CASES','20'))),('trace',int(os.environ.get('TRACE_CASES','60')))]:
    for i in range(count):
-    env={**os.environ,'PS3_PRIO_START':'1','DIAG_QOS':profile}
+    env={**os.environ,'PS3_PRIO_START':'1','DIAG_QOS':profile.split('-')[0]}
     p=subprocess.run([str(binaries[variant])],env=env,capture_output=True,text=True,timeout=30)
     (out/f'{variant}-{i:03}.stdout').write_text(p.stdout);(out/f'{variant}-{i:03}.stderr').write_text(p.stderr)
     traces=[json.loads(l[6:]) for l in p.stdout.splitlines() if l.startswith('TRACE ')]
