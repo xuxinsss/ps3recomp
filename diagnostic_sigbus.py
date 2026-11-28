@@ -1,6 +1,33 @@
 from pathlib import Path
 import os,sys,subprocess,json,hashlib,time,resource
 R=Path(__file__).resolve().parent;mode=sys.argv[1];O=R/'sigbus-evidence'/mode;O.mkdir(parents=True,exist_ok=True)
+if mode=='paired':
+ source=(R/'tests/test_ppu_prio_start.c').read_text();summary=[]
+ prefix='''#include <sys/mman.h>
+#include <stddef.h>
+static int observe_protect(void*,size_t,int);
+#define mprotect observe_protect
+'''
+ suffix=r'''
+#undef mprotect
+#include <errno.h>
+static int observe_protect(void* a,size_t n,int prot) {
+ int rc=mprotect(a,n,prot),err=errno;char b[512];
+ int len=snprintf(b,sizeof b,"PROTECT vm=%p addr=%p bytes=%zu prot=%d rc=%d errno=%d\n",vm_base,a,n,prot,rc,err);write(2,b,len);errno=err;return rc;
+}
+'''
+ fixed=source.replace('vm_base = calloc(1, 0x10000); assert(vm_base);','vm_base = mmap(NULL, 0x200000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0); assert(vm_base != MAP_FAILED);').replace('next_addr = 0x10000000u; g_vm_stack_alloc.region_end = 0xA0000000u;','next_addr = 0x10000u; g_vm_stack_alloc.region_end = 0x200000u;').replace('free(vm_base);','assert(munmap(vm_base, 0x200000) == 0);')
+ for label,content in [('original',source),('owned',fixed)]:
+  # The copied fixture retains its relative runtime include by using an absolute path.
+  content=content.replace('../runtime/',str(R/'runtime')+'/')
+  f=O/(label+'.c');f.write_text(prefix+content+suffix)
+  b=O/label;cmd=['clang','-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections','-Iinclude','-Iruntime','-Iruntime/syscalls',str(f),'-Wl,-dead_strip','-o',str(b)]
+  subprocess.run(cmd,cwd=R,check=True)
+  for i in range(100):
+   env=dict(os.environ);env.pop('PS3_PRIO_START',None)
+   if i%2:env['PS3_PRIO_START']='1'
+   p=subprocess.run([str(b)],env=env,capture_output=True,text=True,timeout=60);(O/f'{label}-{i:03d}.log').write_text(p.stdout+p.stderr);summary.append(dict(variant=label,case=i,on=bool(i%2),exit=p.returncode));print(label,i,p.returncode,flush=True)
+ (O/'results.json').write_text(json.dumps(summary,indent=2));print('COLLECTION ONLY; original faults preserved');raise SystemExit(0)
 env={k:v for k,v in os.environ.items() if k not in ['PS3_PRIO_START','PS3_PRIO_TEST_HOST_DELAY_MS']}
 flags=['clang','-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections','-Iinclude','-Iruntime','-Iruntime/syscalls']
 binary=O/'thread-integration'
