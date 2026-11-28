@@ -2,6 +2,9 @@
 import os, re, subprocess, tempfile
 from pathlib import Path
 from msvc_env import environ
+if os.name != 'nt':
+    print('SKIP: this regression requires Windows D3D12 / D3DCompiler')
+    raise SystemExit(0)
 root=Path(__file__).resolve().parents[1]
 source=(root/'libs/video/rsx_d3d12_backend.c').read_text(encoding='utf-8')
 source=source[source.index('static int dsconv_init(void)'):]

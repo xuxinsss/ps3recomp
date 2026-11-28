@@ -3,6 +3,9 @@
 import os, subprocess, tempfile
 from pathlib import Path
 from msvc_env import environ
+if os.name != 'nt':
+    print('SKIP: this regression requires Windows D3D12 / D3DCompiler')
+    raise SystemExit(0)
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='d3d12-pipeline-cache-') as tmp:
     binary=Path(tmp)/'test.exe'

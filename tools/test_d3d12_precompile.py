@@ -1,13 +1,23 @@
 """Exercise bounds checks without using or distributing game assets."""
+import os
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-tool = Path(sys.argv[1]).resolve()
+if os.name != 'nt':
+    print('SKIP: the Cg/DXBC preparation utility requires Windows D3DCompiler')
+    raise SystemExit(0)
 with tempfile.TemporaryDirectory(prefix='cg-precompile-test-') as tmp:
     root = Path(tmp)
+    if len(sys.argv) > 1:
+        tool = Path(sys.argv[1]).resolve()
+    else:
+        # CI discovers test_*.py without arguments; compile the real utility.
+        build = Path(__file__).with_name('build_d3d12_precompile.py')
+        subprocess.run([sys.executable, str(build), str(root/'tool')], check=True)
+        tool = root/'tool/d3d12-precompile-cg.exe'
     cases = [
         ('empty', b'', 2),
         ('no-programs', bytes(96), 1),
