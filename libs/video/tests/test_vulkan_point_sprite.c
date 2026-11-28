@@ -56,10 +56,11 @@ static Lit draw_point(float reg, u32 mask, float vp_size, u32 control, u32 aa, i
     for (u32 i = 0; i < 16; i++) { u32 w; memcpy(&w, vp + i * 4, 4); method(0x0B80 + i * 4, w); }
     method(0x1EA0, 0);
     rsx_test_fp_mov_r0_col0(vm_base + 0x60000, RSX_TEST_FP_SWZ_IDENT);
+    /* Keep blue opaque so a valid (0,0) coordinate is not mistaken for clear. */
     if (coords) rsx_test_fp_instr(vm_base + 0x60000,
         RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
         RSX_TEST_FP_INSRC_TC0 | RSX_TEST_FP_END,
-        RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+        RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ(0,1,3,3));
     method(0x1EE8, control);
     method(0x08E4, 0x60002);
     method(0x1D60, 64);
@@ -89,7 +90,7 @@ static Lit draw_point(float reg, u32 mask, float vp_size, u32 control, u32 aa, i
         if (coords && (control & 0x101u) == 0x101u) {
             const u8* left = (const u8*)&px[(h/2)*w + w/2 - 1];
             const u8* right = (const u8*)&px[(h/2)*w + w/2 + 1];
-            CHECK(left[0] < right[0] && left[0] > 0 && right[0] < 255,
+            CHECK(left[0] < right[0] && left[2] == 255 && right[2] == 255,
                   "selected TC0 has a horizontal PointCoord gradient");
         } else if (coords) {
             const u8* centre = (const u8*)&px[(h/2)*w + w/2];
