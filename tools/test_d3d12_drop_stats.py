@@ -30,7 +30,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="d3d12-drops-") as tmp:
         exe = Path(tmp) / "test_d3d12_drop_stats.exe"
         cmd = [cc, "/nologo", "/std:c17", "/O1", "/MT", "/w", "/D_CRT_SECURE_NO_WARNINGS",
-               "/Iinclude", "/Ilibs/video", "/Ilibs", "/Iruntime", "/I.", f"/Fo{tmp}\\",
+               "/Iinclude", "/Ilibs/video", "/Ilibs", "/Iruntime", "/Iruntime/spu", "/I.", f"/Fo{tmp}\\",
                *SOURCES, f"/Fe{exe}", "/link", "d3d12.lib", "dxgi.lib", "dxguid.lib", "d3dcompiler.lib",
                "user32.lib", "gdi32.lib", "ole32.lib"]
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)

@@ -26,6 +26,11 @@ u32 gcm_io_offset_to_ea(u32 offset) { (void)offset; no_guest("IO map"); return 0
 void vm_write32(uint32_t a, uint32_t v) { (void)a; (void)v; no_guest("memory write"); }
 void ps3_ms(const char* key) { (void)key; }
 unsigned long long ps3_ms_now(void) { return 0; }
+void spu_lockline_lock(void) { no_guest("SPU reservation lock"); }
+void spu_lockline_unlock(void) { no_guest("SPU reservation unlock"); }
+int spu_coh_is_reserved(u32 address) { (void)address; no_guest("SPU reservation query"); return 0; }
+void spu_coh_notify_write(u32 address) { (void)address; no_guest("SPU reservation write"); }
+
 
 static int failures, checks;
 #define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr, "FAIL %s\n", name); } \
@@ -43,7 +48,7 @@ int main(void)
     static u8 mapped[64];
     s_d3d.pipeline_ready = 1; s_d3d.vb_mapped = mapped;
     d3d12_draw_arrays(NULL, RSX_PRIMITIVE_TRIANGLES, 0, 0);
-    d3d12_draw_indexed(NULL, RSX_PRIMITIVE_TRIANGLES, 0, MAX_VERTICES + 1);
+    d3d12_draw_indexed(NULL, RSX_PRIMITIVE_TRIANGLES, 0, s_vertex_capacity + 1);
     CHECK(s_d3d12_stats.drop[D3D12_DROP_BAD_COUNT] == 2, "empty and oversized draws drop as bad_count");
 
     /* An indexed draw without vertex-program resources: no_vp_resources. */
