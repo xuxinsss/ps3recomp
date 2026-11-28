@@ -1,0 +1,1580 @@
+diff --git a/libs/spurs/tests/test_owner_ports.c b/libs/spurs/tests/test_owner_ports.c
+new file mode 100644
+index 0000000..905402a
+--- /dev/null
++++ b/libs/spurs/tests/test_owner_ports.c
+@@ -0,0 +1,52 @@
++#include "../cellSpurs.h"
++#include "../../../runtime/platform/win32_compat.h"
++#include <stdio.h>
++#include <stdlib.h>
++extern uint8_t* vm_base;
++#define GUEST_PTR(p,T) ((T)((p)?(void*)(vm_base+(uint32_t)(uintptr_t)(p)):(void*)0))
++#include "spurs_ports_under_test.inc"
++#include <assert.h>
++uint8_t* vm_base;
++void sys_event_queue_cancel_by_id(uint32_t q) {(void)q;}
++void sys_event_queue_uncancel_by_id(uint32_t q) {(void)q;}
++int main(void) {
++ vm_base=calloc(1,0x10000); assert(vm_base);
++ CellSpurs* a=(CellSpurs*)(uintptr_t)0x2000;
++ CellSpurs* b=(CellSpurs*)(uintptr_t)0x4000;
++ u8* port=(u8*)(uintptr_t)0x100;
++ vm_base[0x100]=1;
++ assert(cellSpursAttachLv2EventQueue(a,11,port,0)==CELL_OK);
++ assert(cellSpursAttachLv2EventQueue(b,22,port,0)==CELL_OK);
++ assert(s_spurs_event_queue_n==2);
++ assert(cellSpursAttachLv2EventQueue(a,33,port,0)==CELL_SPURS_CORE_ERROR_BUSY);
++ assert(s_spurs_event_queue_n==2);
++ assert(cellSpursDetachLv2EventQueue(a,1)==CELL_OK);
++ assert(port_binding(0x4000,1)>=0 && port_binding(0x2000,1)<0);
++ vm_base[0x100]=0;
++ assert(cellSpursAttachLv2EventQueue(a,33,port,1)==CELL_OK && vm_base[0x100]==16);
++ assert(cellSpursAttachLv2EventQueue(b,44,port,1)==CELL_OK && vm_base[0x100]==16);
++ spurs_cancel_attached_queues(0x2000);
++ assert(port_binding(0x4000,1)>=0 && port_binding(0x4000,16)>=0 && s_spurs_event_queue_n==2);
++ spurs_cancel_attached_queues(0);
++ for (unsigned owner=0x2000; owner<=0xA000; owner+=0x2000) {
++  for(unsigned i=0;i<64;i++) {
++   vm_base[0x100]=0xEF;
++   assert(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)owner,owner,port,1)==CELL_OK);
++   assert(vm_base[0x100]==(16+i)%64);
++   assert(spurs_port_queue(owner,vm_base[0x100])==owner);
++  }
++  vm_base[0x100]=0xEF;
++  assert(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)owner,owner,port,1)==CELL_SPURS_CORE_ERROR_BUSY);
++  assert(vm_base[0x100]==0xEF);
++ }
++ assert(s_spurs_event_queue_n==320);
++ assert(spurs_port_queue(0,16)==0 && spurs_port_queue(0x2000,64)==0);
++ assert(cellSpursDetachLv2EventQueue(a,16)==0);
++ vm_base[0x100]=0;
++ assert(cellSpursAttachLv2EventQueue(a,77,port,1)==0 && vm_base[0x100]==16);
++ assert(spurs_port_queue(0x2000,16)==77 && spurs_port_queue(0x4000,16)==0x4000);
++ spurs_cancel_attached_queues(0);
++ assert(s_spurs_event_queue_n==0 && s_spurs_ports==NULL);
++ puts("PASS: per-instance static/dynamic ports, duplicate rejection, detach and owner cancellation");
++ free(vm_base); return 0;
++}
+diff --git a/libs/spurs/tests/test_owner_routing.c b/libs/spurs/tests/test_owner_routing.c
+new file mode 100644
+index 0000000..3a23162
+--- /dev/null
++++ b/libs/spurs/tests/test_owner_routing.c
+@@ -0,0 +1,370 @@
++#include "libs/spurs/cellSpurs.h"
++#include "ps3emu/log_first.h"
++#include "runtime/platform/win32_compat.h"
++#include "runtime/spu/spu_context.h"
++#include "runtime/syscalls/sys_event.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++uint8_t *vm_base;
++uint32_t ppu_vm_size;
++#ifndef _WIN32
++void SetLastError(DWORD error) {
++  (void)error;
++  abort();
++} /* unused group wait */
++#endif
++#define GUEST_PTR(p, T)                                                        \
++  ((T)((p) ? (void *)(vm_base + (uint32_t)(uintptr_t)(p)) : (void *)0))
++#include "spurs_ports_under_test.inc"
++/* Non-SPURS branches are not exercised here. These stubs only satisfy their
++ * references; actual SPURS lookup, mailbox operations, queue push and receive
++ * are production code. No fake queue delivery or receive. */
++typedef struct {
++  struct {
++    uint32_t spup, queue;
++  } evt_bind[64];
++  int evt_bind_n;
++} spu_thread_t;
++typedef struct {
++  uint32_t user_event_ports[64];
++} spu_group_t;
++static spu_thread_t *spu_find_thread(uint32_t id) {
++  (void)id;
++  abort();
++  return NULL;
++}
++static spu_group_t *spu_find_group(uint32_t id) {
++  (void)id;
++  abort();
++  return NULL;
++}
++int64_t sys_event_flag_set(ppu_context *c) {
++  (void)c;
++  abort();
++  return 0;
++}
++#include "spurs_delivery_under_test.inc"
++static int failures;
++#define CHECK(x)                                                               \
++  do {                                                                         \
++    if (!(x)) {                                                                \
++      printf("FAIL line %d: %s\n", __LINE__, #x);                              \
++      ++failures;                                                              \
++    }                                                                          \
++  } while (0)
++static uint32_t be32(uint32_t a) {
++  return (uint32_t)vm_base[a] << 24 | (uint32_t)vm_base[a + 1] << 16 |
++         (uint32_t)vm_base[a + 2] << 8 | vm_base[a + 3];
++}
++static uint64_t be64(uint32_t a) {
++  return ((uint64_t)be32(a) << 32) | be32(a + 4);
++}
++static void put32(uint8_t *p, uint32_t v) {
++  p[0] = v >> 24;
++  p[1] = v >> 16;
++  p[2] = v >> 8;
++  p[3] = v;
++}
++static uint32_t newq(void) {
++  uint32_t q = sys_event_queue_create_direct(0, 16);
++  CHECK(q != 0);
++  return q;
++}
++static uint32_t attach(uint32_t owner, uint32_t q, uint8_t port, int dyn) {
++  vm_base[0x100] = port;
++  uint32_t rc = cellSpursAttachLv2EventQueue((CellSpurs *)(uintptr_t)owner, q,
++                                             (u8 *)(uintptr_t)0x100, dyn);
++  CHECK(rc == CELL_OK);
++  return vm_base[0x100];
++}
++static void destroy(uint32_t q) {
++  ppu_context c = {0};
++  c.gpr[3] = q;
++  c.gpr[4] = SYS_EVENT_QUEUE_DESTROY_FORCE;
++  CHECK(sys_event_queue_destroy(&c) == 0);
++}
++static void receive(uint32_t q, uint32_t expected, uint32_t payload) {
++  ppu_context c = {0};
++  c.gpr[3] = q;
++  c.gpr[4] = 0x400;
++  c.gpr[5] = 16;
++  c.gpr[6] = 0x200;
++  CHECK(sys_event_queue_tryreceive(&c) == CELL_OK);
++  uint32_t count = be32(0x200);
++  printf("receive queue=%u count=%u expected=%u data=%llx\n", q, count,
++         expected, (unsigned long long)(count ? be64(0x418) : 0));
++  CHECK(count == expected);
++  if (expected && count)
++    for (uint32_t i = 0; i < count; i++) {
++      CHECK(be64(0x400 + 32 * i) == 0xFFFFFFFF53505501ull);
++      CHECK(be64(0x418 + 32 * i) == payload);
++    }
++}
++static uint32_t expected_ack;
++static void send(uint32_t owner, uint32_t port, uint32_t payload,
++                 int throwing) {
++  spu_context s;
++  memset(&s, 0, sizeof s);
++  s.ls = s.ls_store;
++  s.spu_id = owner;
++  s.image_id = 7;
++  s.spurs_ea = owner;
++  /* LS contents do not determine routing; the captured context owner does. */
++  put32(s.ls + 0x1c4, owner);
++  put32(s.ls + 0x2764, owner);
++  spu_channel_write(&s.ch_out_mbox, payload);
++  int handled =
++      spu_deliver_user_event(&s, ((port + (throwing ? 64 : 0)) << 24) | 0x123);
++  printf("send owner=%x port=%u handled=%d ack_count=%u\n", owner, port,
++         handled, s.ch_in_mbox.count);
++  CHECK(handled == 1);
++  if (!throwing) {
++    CHECK(s.ch_in_mbox.count == 1);
++    if (s.ch_in_mbox.count)
++      CHECK(spu_channel_read(&s.ch_in_mbox) == expected_ack);
++  } else
++    CHECK(s.ch_in_mbox.count == 0);
++}
++/* Two simultaneously active senders must not share a routing identity. */
++typedef struct {
++  uint32_t owner, port, payload;
++  int failed;
++} Sender;
++static volatile LONG senders_ready;
++static void sender_run(Sender *w) {
++  spu_context c;
++  memset(&c, 0, sizeof c);
++  c.spurs_ea = w->owner;
++  InterlockedIncrement(&senders_ready);
++  while (InterlockedCompareExchange(&senders_ready, 0, 0) < 2)
++    Sleep(1);
++  for (unsigned i = 0; i < 16; i++) {
++    spu_channel_write(&c.ch_out_mbox, w->payload);
++    if (spu_deliver_user_event(&c, w->port << 24) != 1 ||
++        c.ch_in_mbox.count != 1 || spu_channel_read(&c.ch_in_mbox) != CELL_OK)
++      w->failed++;
++  }
++}
++#ifdef _WIN32
++static DWORD WINAPI sender_entry(void *p) {
++  sender_run(p);
++  return 0;
++}
++#else
++static void *sender_entry(void *p) {
++  sender_run(p);
++  return NULL;
++}
++#endif
++static void concurrent_senders(uint32_t a, uint32_t b, uint32_t q1,
++                               uint32_t q2) {
++  attach(a, q1, 1, 0);
++  attach(b, q2, 1, 0);
++  Sender workers[2] = {{a, 1, 0xa1, 0}, {b, 1, 0xb1, 0}};
++#ifdef _WIN32
++  HANDLE threads[2];
++  for (int i = 0; i < 2; i++) {
++    threads[i] =
++        CreateThread(NULL, 1u << 20, sender_entry, &workers[i], 0, NULL);
++    CHECK(threads[i] != NULL);
++  }
++  for (int i = 0; i < 2; i++) {
++    CHECK(WaitForSingleObject(threads[i], 5000) == WAIT_OBJECT_0);
++    CloseHandle(threads[i]);
++  }
++#else
++  pthread_t threads[2];
++  for (int i = 0; i < 2; i++)
++    CHECK(pthread_create(&threads[i], NULL, sender_entry, &workers[i]) == 0);
++  for (int i = 0; i < 2; i++)
++    CHECK(pthread_join(threads[i], NULL) == 0);
++#endif
++  CHECK(!workers[0].failed && !workers[1].failed);
++  receive(q1, 16, 0xa1);
++  receive(q2, 16, 0xb1);
++}
++int main(int argc, char **argv) {
++  if (argc != 2)
++    return 2;
++  vm_base = calloc(1, 0x10000);
++  ppu_vm_size = 0x10000;
++  CHECK(vm_base != NULL);
++  uint32_t a = 0x2000, b = 0x4000, q1 = newq(), q2 = newq();
++  const char *mode = argv[1];
++  if (!strcmp(mode, "single")) {
++    attach(a, q1, 1, 0);
++    send(a, 1, 0xa1, 0);
++    receive(q1, 1, 0xa1);
++    receive(q2, 0, 0);
++    send(a, 1, 0xa2, 1);
++    receive(q1, 1, 0xa2);
++  } else if (!strcmp(mode, "same-static") || !strcmp(mode, "same-dynamic")) {
++    int dyn = !strcmp(mode, "same-dynamic");
++    uint32_t p1 = attach(a, q1, 1, dyn), p2 = attach(b, q2, 1, dyn);
++    CHECK(p1 == p2);
++    send(b, p2, 0xb1, 0);
++    receive(q1, 0, 0);
++    receive(q2, 1, 0xb1);
++  } else if (!strcmp(mode, "distinct-ports")) {
++    attach(a, q1, 1, 0);
++    attach(b, q2, 2, 0);
++    send(a, 1, 0xa1, 0);
++    send(b, 2, 0xb1, 0);
++    receive(q1, 1, 0xa1);
++    receive(q2, 1, 0xb1);
++  } else if (!strcmp(mode, "reverse-order")) {
++    attach(b, q2, 1, 0);
++    attach(a, q1, 1, 0);
++    send(a, 1, 0xa1, 0);
++    receive(q2, 0, 0);
++    receive(q1, 1, 0xa1);
++  } else if (!strcmp(mode, "throw-collision")) {
++    attach(a, q1, 1, 0);
++    attach(b, q2, 1, 0);
++    send(b, 1, 0xb1, 1);
++    receive(q1, 0, 0);
++    receive(q2, 1, 0xb1);
++  } else if (!strcmp(mode, "duplicate-no-mutation")) {
++    attach(a, q1, 1, 0);
++    vm_base[0x100] = 1;
++    CHECK(cellSpursAttachLv2EventQueue((CellSpurs *)(uintptr_t)a, q2,
++                                       (u8 *)(uintptr_t)0x100,
++                                       0) == CELL_SPURS_CORE_ERROR_BUSY);
++    CHECK(s_spurs_event_queue_n == 1);
++    send(a, 1, 0xa1, 0);
++    receive(q1, 1, 0xa1);
++    receive(q2, 0, 0);
++  } else if (!strcmp(mode, "detach")) {
++    attach(a, q1, 1, 0);
++    attach(b, q2, 1, 0);
++    CHECK(cellSpursDetachLv2EventQueue((CellSpurs *)(uintptr_t)0x6000, 1) == 0);
++    CHECK(s_spurs_event_queue_n == 2);
++    CHECK(cellSpursDetachLv2EventQueue((CellSpurs *)(uintptr_t)a, 1) == 0);
++    send(b, 1, 0xb1, 0);
++    receive(q1, 0, 0);
++    receive(q2, 1, 0xb1);
++  } else if (!strcmp(mode, "finalize-helper")) {
++    attach(a, q1, 1, 0);
++    attach(b, q2, 1, 0);
++    spurs_cancel_attached_queues(a);
++    CHECK(g_sys_event_queues[q1 - 1].cancelled == 1);
++    CHECK(g_sys_event_queues[q2 - 1].cancelled == 0);
++    CHECK(s_spurs_event_queue_n == 1);
++    send(b, 1, 0xb1, 0);
++    receive(q2, 1, 0xb1);
++    attach(a, q1, 1, 0);
++    CHECK(g_sys_event_queues[q1 - 1].cancelled == 0);
++  } else if (!strcmp(mode, "finalized-sender")) {
++    attach(a, q1, 1, 0);
++    attach(b, q2, 1, 0);
++    spurs_cancel_attached_queues(a);
++    expected_ack = CELL_ENOTCONN;
++    send(a, 1, 0xa1, 0);
++    receive(q2, 0, 0);
++  } else if (!strcmp(mode, "reuse-with-detach")) {
++    attach(a, q1, 1, 0);
++    CHECK(cellSpursDetachLv2EventQueue((CellSpurs *)(uintptr_t)a, 1) == 0);
++    destroy(q1);
++    uint32_t q3 = newq();
++    CHECK(q3 == q1);
++    CHECK(spurs_port_queue(a, 1) == 0);
++    receive(q3, 0, 0);
++  }
++
++  else if (!strcmp(mode, "shared-queue-finalize")) {
++    attach(a, q1, 1, 0);
++    attach(b, q1, 2, 0);
++    spurs_cancel_attached_queues(a);
++    CHECK(port_binding(b, 2) >= 0);
++    CHECK(g_sys_event_queues[q1 - 1].cancelled == 0);
++  } else if (!strcmp(mode, "capacity")) {
++    for (uint32_t i = 0; i < 8; i++)
++      attach(a, q1, (uint8_t)i, 0);
++    vm_base[0x100] = 1;
++    CHECK(cellSpursAttachLv2EventQueue((CellSpurs *)(uintptr_t)b, q2,
++                                       (u8 *)(uintptr_t)0x100, 0) == CELL_OK);
++  } else if (!strcmp(mode, "unknown-owner")) {
++    attach(a, q1, 1, 0);
++    expected_ack = CELL_ENOTCONN;
++    send(0x6000, 1, 0, 0);
++    send(0x6000, 1, 0, 1);
++    receive(q1, 0, 0);
++  } else if (!strcmp(mode, "full-queue")) {
++    attach(a, q1, 1, 0);
++    for (unsigned i = 0; i < 16; i++)
++      send(a, 1, 0xa1, 0);
++    expected_ack = CELL_EBUSY;
++    send(a, 1, 0xb1, 0);
++    receive(q1, 16, 0xa1);
++  } else if (!strcmp(mode, "malformed-mailbox")) {
++    spu_context c;
++    memset(&c, 0, sizeof c);
++    c.spurs_ea = a;
++    attach(a, q1, 1, 0);
++    CHECK(spu_deliver_user_event(&c, 1u << 24) == 1);
++    CHECK(spu_channel_read(&c.ch_in_mbox) == CELL_EINVAL);
++    receive(q1, 0, 0);
++  } else if (!strcmp(mode, "unowned-raw")) {
++    spu_context c;
++    memset(&c, 0, sizeof c);
++    attach(a, q1, 1, 0);
++    spu_channel_write(&c.ch_out_mbox, 0xbeef);
++    CHECK(spu_deliver_user_event(&c, 1u << 24) == 0);
++    CHECK(c.ch_in_mbox.count == 0 && c.ch_out_mbox.count == 1);
++    CHECK(spu_channel_read(&c.ch_out_mbox) == 0xbeef);
++    receive(q1, 0, 0);
++  } else if (!strcmp(mode, "concurrent"))
++    concurrent_senders(a, b, q1, q2);
++  else
++    return 2;
++  printf("RESULT %s: %s (%d failed)\n", mode, failures ? "FAIL" : "PASS",
++         failures);
++  spurs_cancel_attached_queues(0);
++  destroy(q1);
++  destroy(q2);
++  free(vm_base);
++  return failures ? 1 : 0;
++}
++/* Unused blocking receive and workload-dispatch dependencies must fail loudly
++ * if a future test accidentally enters them. */
++void ydkj_release_pending_threads(void) { abort(); }
++void ppu_thread_note_block(uint64_t id) {
++  (void)id;
++  abort();
++}
++void ppu_dump_guest_stack(ppu_context *c, const char *t) {
++  (void)c;
++  (void)t;
++  abort();
++}
++uint32_t spu_elf_image_size(const uint8_t *p) {
++  (void)p;
++  abort();
++  return 0;
++}
++int spu_workload_dispatch_async(const uint8_t *p, uint32_t n, uint32_t a) {
++  (void)p;
++  (void)n;
++  (void)a;
++  abort();
++  return 0;
++}
++int spu_dispatch_frame_by_queue(uint32_t q, uint32_t t) {
++  (void)q;
++  (void)t;
++  abort();
++  return 0;
++}
++int64_t lv2_usec_deadline(uint64_t u) {
++  (void)u;
++  abort();
++  return 0;
++}
++int lv2_deadline_passed(int64_t d) {
++  (void)d;
++  abort();
++  return 0;
++}
++uint32_t g_spu_pending_evt[3];
++int g_spu_pending_evt_valid;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 859aa6b..a71bf84 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -218,6 +218,7 @@ typedef struct spu_context {
+     /* SPU thread identification */
+     uint32_t spu_id;
+     uint32_t spu_group_id;
++    uint32_t spurs_ea; /* owning SPURS instance; 0 for an unowned/raw SPU */
+ 
+     /* Active recompiled image for per-context indirect-branch dispatch. SPURS
+      * loads kernel/policy/job into overlapping LS addresses at different times,
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 499f3a6..e5ae804 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -152,6 +152,7 @@ typedef struct spu_run_opts {
+     int      park_on_empty;
+     uint32_t spu_id;
+     uint32_t group_id;
++    uint32_t spurs_ea; /* explicit owner, independent of guest LS overlays */
+ } spu_run_opts;
+ 
+ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+@@ -173,6 +174,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+     if (opts) {
+         ctx.spu_id              = opts->spu_id;
+         ctx.spu_group_id        = opts->group_id;
++        ctx.spurs_ea            = opts->spurs_ea;
+         ctx.park_on_empty_inmbox = opts->park_on_empty;
+         if (opts->inmbox_val) spu_channel_write(&ctx.ch_in_mbox, opts->inmbox_val);
+         /* Publish the LIVE context for the duration of the run so the PPU side
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 4e2fc51..52c3c29 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -156,8 +156,13 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
+ SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
+ void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
+ 
+-int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+-                      uint32_t job_ea, uint32_t job_desc_size)
++int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea, uint32_t job_desc_size)
++{
++    return spu_run_spurs_job_owned(entry, image_id, job_ea, job_desc_size, 0);
++}
++
++int spu_run_spurs_job_owned(spu_lifted_entry_fn entry, int image_id,
++                      uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea)
+ {
+     if (!entry || !job_ea) return -1;
+ 
+@@ -366,6 +371,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+     /* ---- enter the job -------------------------------------------------- */
+     spu_context ctx;
+     spu_context_init(&ctx, 0);
++    ctx.spurs_ea = spurs_ea;
+     ctx.image_id = image_id;
+     memcpy(ctx.ls, ls, SPU_LS_SIZE);
+     /* SPU stack grows down. A function saves its link register in its
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 02a0c30..50a8277 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -318,6 +318,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+     resident->entry = entry; resident->image_id = image_id;
+     ctx->image_id    = image_id;
+     ctx->policy_mode = 1;
++    ctx->spurs_ea = spurs_ea;
+ 
+     /* PM image at its load base (first entry only -- LS persists). */
+     if (first)
+@@ -721,6 +722,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
+     spu_context_init(ctx, 0);
+     ctx->image_id    = 100;      /* policy's own indirect-branch table */
+     ctx->policy_mode = 1;
++    ctx->spurs_ea = spurs_ea;
+ 
+     /* Policy module image at its load base LS 0xA00 (code + data tables). */
+     /* size 0 = this port linked the default stub blob (spurs_policy_blob_weak.c),
+diff --git a/runtime/spu/tests/test_spu_group_lifecycle.c b/runtime/spu/tests/test_spu_group_lifecycle.c
+index 8503b4f..6c56697 100644
+--- a/runtime/spu/tests/test_spu_group_lifecycle.c
++++ b/runtime/spu/tests/test_spu_group_lifecycle.c
+@@ -26,7 +26,7 @@ uint32_t ppu_vm_size;
+ #ifndef _WIN32
+ void SetLastError(DWORD e) { (void)e; }
+ #endif
+-uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
++uint32_t spurs_port_queue(uint32_t owner, uint32_t port) { (void)owner; (void)port; return 0; }
+ int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
+ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail) { (void)image; (void)max_avail; return 0; }
+ 
+diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
+index e1e0287..8d93892 100644
+--- a/runtime/spu/tests/test_spu_lifted_start.c
++++ b/runtime/spu/tests/test_spu_lifted_start.c
+@@ -1326,7 +1326,7 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
+ uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+ uint32_t ps3_spu_image_source_ea(uint32_t ea) { return ea; }
+ /* cellSpurs owns this; 0 = "not a SPURS port", the plain lv2 event path. */
+-uint32_t spurs_port_queue(uint32_t port)        { (void)port; return 0; }
++uint32_t spurs_port_queue(uint32_t owner, uint32_t port)        { (void)owner; (void)port; return 0; }
+ void sys_raw_spu_init(lv2_syscall_table* t) { (void)t; }
+ void sys_rsx_init(lv2_syscall_table* t) { (void)t; }
+ void spu_raw_note_image(uint32_t ea, uint32_t src) { (void)ea; (void)src; }
+diff --git a/runtime/spu/tests/test_spu_taskset_elf_flags.c b/runtime/spu/tests/test_spu_taskset_elf_flags.c
+index 6d7a322..1260cef 100644
+--- a/runtime/spu/tests/test_spu_taskset_elf_flags.c
++++ b/runtime/spu/tests/test_spu_taskset_elf_flags.c
+@@ -14,14 +14,15 @@ uint8_t* vm_base;
+ uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+ static unsigned dispatches;
+ static const uint8_t* dispatched_image;
+-static uint32_t dispatched_size, dispatched_context;
++static uint32_t dispatched_size, dispatched_context, dispatched_taskset, dispatched_task;
+ /* The scheduler updates the taskset's bitset line under the lock-line lock;
+  * single-threaded here, so the lock and the coherency note are no-ops. */
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
+-static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
++static int spu_workload_dispatch_task(const uint8_t* image, uint32_t size, uint32_t context, uint32_t taskset, uint32_t task)
+ {
++    dispatched_taskset = taskset; dispatched_task = task;
+     dispatches++; dispatched_image = image; dispatched_size = size;
+     dispatched_context = context; return 1;
+ }
+@@ -71,7 +72,7 @@ int main(void)
+         CHECK(dispatched_image == vm_base + ELF, "dispatch uses ELF base, not tagged address");
+         CHECK(dispatched_size == 100, "real parser receives synthetic ELF header");
+         CHECK(dispatched_context == CONTEXT, "context argument is preserved");
+-        CHECK(g_ydkj_real_taskset_ea == TASKSET && g_ydkj_real_taskid == 0,
++        CHECK(dispatched_taskset == TASKSET && dispatched_task == 0,
+               "requeued task keeps its taskset and slot identity");
+         CHECK(memcmp(before, vm_base + TASKSET + 0x80, sizeof(before)) == 0,
+               "TaskInfo flags and all other metadata remain unchanged");
+diff --git a/runtime/spu/tests/test_spu_thread_image_id.c b/runtime/spu/tests/test_spu_thread_image_id.c
+index 3eaf8c3..aa24f9c 100644
+--- a/runtime/spu/tests/test_spu_thread_image_id.c
++++ b/runtime/spu/tests/test_spu_thread_image_id.c
+@@ -20,7 +20,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
+ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+ void SetLastError(DWORD e) { (void)e; }
+-uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
++uint32_t spurs_port_queue(uint32_t owner, uint32_t port) { (void)owner; (void)port; return 0; }
+ int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
+ 
+ /* --- the registry, reduced to what the lookup needs: two images, both with code at 0xD0 --- */
+diff --git a/runtime/spu/tests/test_spu_user_event_port.c b/runtime/spu/tests/test_spu_user_event_port.c
+index 26e7db3..e3fc29f 100644
+--- a/runtime/spu/tests/test_spu_user_event_port.c
++++ b/runtime/spu/tests/test_spu_user_event_port.c
+@@ -22,7 +22,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
+ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+ void SetLastError(DWORD e) { (void)e; }                       /* the POSIX shim's condition variable reports a timeout */
+-uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
++uint32_t spurs_port_queue(uint32_t owner, uint32_t port) { (void)owner; (void)port; return 0; }
+ int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
+ 
+ /* What the delivery pushes at the queue, recorded instead of sent. */
+diff --git a/runtime/spu/tests/test_spu_workload_masked.c b/runtime/spu/tests/test_spu_workload_masked.c
+index 81e3cc7..f989aee 100644
+--- a/runtime/spu/tests/test_spu_workload_masked.c
++++ b/runtime/spu/tests/test_spu_workload_masked.c
+@@ -17,6 +17,7 @@
+ /* The rest of spu_workload.c (dispatch, SPURS jobs, the policy-module runner)
+  * is outside this fixture. */
+ uint8_t* vm_base;
++uint32_t ppu_vm_size;
+ uint32_t g_barrier_sync_watch;
+ void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
+ uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskid, g_ydkj_real_taskset_ea;
+@@ -83,3 +84,5 @@ int main(void)
+     printf("test_spu_workload_masked: ok\n");
+     return 0;
+ }
++int spu_run_spurs_job_owned(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz, uint32_t owner)
++{ (void)owner; return spu_run_spurs_job(e, id, ea, sz); }
+diff --git a/runtime/spu/tests/test_spurs_dispatch_owner.c b/runtime/spu/tests/test_spurs_dispatch_owner.c
+new file mode 100644
+index 0000000..fe8f1f8
+--- /dev/null
++++ b/runtime/spu/tests/test_spurs_dispatch_owner.c
+@@ -0,0 +1,161 @@
++/* Real async worker / ELF loader / context owner regression. Unrelated SPU
++ * instruction execution and coherency dependencies are stubbed below. */
++#include "../spu_workload.c"
++#include <assert.h>
++
++/* Async dispatch, the ELF loader and context construction are real. Only
++ * unrelated jobs, policy probes, instruction execution and coherency are
++ * stubbed. */
++uint8_t *vm_base;
++uint32_t ppu_vm_size;
++uint32_t g_barrier_sync_watch;
++void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
++uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskid, g_ydkj_real_taskset_ea;
++unsigned long long ps3_ms_now(void) { return 0; }
++#include <stdatomic.h>
++static atomic_uint exits;
++void spu_coh_notify_write(uint32_t a) {
++  if (a == 0x1000 || a == 0x4000)
++    atomic_fetch_add(&exits, 1);
++}
++void spu_coh_unregister(spu_context *c) { (void)c; }
++void spu_coh_watch_add(spu_coh_watch *w, uint32_t ea, void (*wake)(void *),
++                       void *opaque) {
++  (void)w;
++  (void)ea;
++  (void)wake;
++  (void)opaque;
++}
++void spu_coh_watch_remove(spu_coh_watch *w) { (void)w; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_mfc_release(spu_context *c) { (void)c; }
++int spu_run_spurs_job(spu_lifted_entry_fn e, int id, uint32_t ea, uint32_t sz) {
++  (void)e;
++  (void)id;
++  (void)ea;
++  (void)sz;
++  return -1;
++}
++int spu_run_with_halt(void (*f)(spu_context *), spu_context *c) {
++  f(c);
++  return 0;
++}
++void spu_thread_publish_ctx(uint32_t tid, void *c) {
++  (void)tid;
++  (void)c;
++}
++uint64_t spurs_pm_build_context(uint8_t *ls, uint32_t a, uint32_t b, uint32_t c,
++                                uint32_t d) {
++  (void)ls;
++  (void)a;
++  (void)b;
++  (void)c;
++  (void)d;
++  return 0;
++}
++int spurs_run_taskset_policy_probe(uint32_t a, uint32_t b, uint32_t c,
++                                   uint64_t d, uint32_t e, uint8_t *ls,
++                                   uint32_t f) {
++  (void)a;
++  (void)b;
++  (void)c;
++  (void)d;
++  (void)e;
++  (void)ls;
++  (void)f;
++  return -1;
++}
++void tsp_spu_func_00000A00(spu_context *c) { (void)c; }
++void ydkj_wake_all_event_flags(void) {}
++
++static void prog_a(spu_context *c) { (void)c; }
++static void prog_b(spu_context *c) { (void)c; }
++
++int spu_run_spurs_job_owned(spu_lifted_entry_fn e, int id, uint32_t ea,
++                            uint32_t sz, uint32_t owner) {
++  (void)owner;
++  return spu_run_spurs_job(e, id, ea, sz);
++}
++
++static atomic_uint entered, gate, observed[2];
++static void owner_entry(spu_context *ctx) {
++  unsigned index = ctx->spurs_ea == 0x11100 ? 0 : 1;
++  assert(ctx->spurs_ea == (index ? 0x22200u : 0x11100u));
++  atomic_store(&observed[index], ctx->spurs_ea);
++  atomic_fetch_add(&entered, 1);
++  while (!atomic_load(&gate))
++    Sleep(1);
++  assert(ctx->spurs_ea == (index ? 0x22200u : 0x11100u));
++}
++static void put32(uint8_t *p, uint32_t v) {
++  p[0] = v >> 24;
++  p[1] = v >> 16;
++  p[2] = v >> 8;
++  p[3] = v;
++}
++static void put16(uint8_t *p, uint16_t v) {
++  p[0] = v >> 8;
++  p[1] = v;
++}
++static void wait_count(atomic_uint *count, unsigned n) {
++  for (unsigned i = 0; i < 5000 && atomic_load(count) < n; i++)
++    Sleep(1);
++  assert(atomic_load(count) == n);
++}
++int main(void) {
++  vm_base = calloc(1, 0x30000);
++  assert(vm_base);
++  ppu_vm_size = 0x30000;
++  uint8_t *image = vm_base + 0x10000;
++  memcpy(image, "\177ELF", 4);
++  image[4] = 1;
++  image[5] = 2;
++  image[6] = 1;
++  put16(image + 0x10, 2);
++  put16(image + 0x12, 23);
++  put32(image + 0x14, 1);
++  put32(image + 0x18, 0x3000);
++  put32(image + 0x1c, 52);
++  put16(image + 0x28, 52);
++  put16(image + 0x2a, 32);
++  put16(image + 0x2c, 1);
++  put32(image + 52, 1);
++  put32(image + 56, 84);
++  put32(image + 60, 0x3000);
++  put32(image + 68, 16);
++  put32(image + 72, 16);
++  put32(image + 76, 5);
++  put32(image + 80, 16);
++  put32(vm_base + 0x1064, 0x11100);
++  put32(vm_base + 0x4064, 0x22200);
++  spu_workload_register_img(spu_workload_fingerprint(image, 100), owner_entry,
++                            99, "owner capture fixture");
++  g_ydkj_real_taskset_ea = 0x4000;
++  g_ydkj_real_taskid = 77;
++  g_ydkj_real_spurs_ea = 0xDEAD;
++  assert(spu_workload_dispatch_task(image, 100, 0, 0x1000, 0) == 1);
++  g_ydkj_real_taskset_ea = 0x1000;
++  g_ydkj_real_taskid = 66;
++  assert(spu_workload_dispatch_task(image, 100, 0, 0x4000, 0) == 1);
++  wait_count(&entered, 2);
++  assert(atomic_load(&observed[0]) == 0x11100 &&
++         atomic_load(&observed[1]) == 0x22200);
++  g_ydkj_real_spurs_ea = 0xBAD;
++  atomic_store(&gate, 1);
++  wait_count(&exits, 2);
++  puts("PASS: two real async workers preserve explicit taskset owner despite "
++       "misleading globals");
++  /* Detached workers may still retire host contexts after notifying exit.
++   * Guest storage remains alive until process exit. */
++  return 0;
++}
++
++void spu_coh_forget_range(uintptr_t lo, uintptr_t hi) {
++  (void)lo;
++  (void)hi;
++}
++void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi) {
++  (void)lo;
++  (void)hi;
++}
+diff --git a/runtime/spu/tests/test_spurs_job_stack.c b/runtime/spu/tests/test_spurs_job_stack.c
+index 6421a85..746299b 100644
+--- a/runtime/spu/tests/test_spurs_job_stack.c
++++ b/runtime/spu/tests/test_spurs_job_stack.c
+@@ -1,3 +1,4 @@
++#include <assert.h>
+ /*
+  * A SPURS job's first stack frame must not overlap its cache buffer
+  * (runtime/spu/spurs_job.c).
+@@ -108,6 +109,7 @@ static uint32_t g_cache_ls, g_sp;
+  * frame, then push a frame of its own and store the back chain. */
+ static void job_entry(spu_context* ctx)
+ {
++    assert(ctx->spurs_ea == 0x123400);
+     const uint32_t sp = ctx->gpr[1]._u32[0];
+     g_ran = 1;
+     g_sp = sp;
+@@ -130,7 +132,7 @@ static void run_case(const char* name, uint16_t stack_qw, uint16_t scratch_qw)
+     TEST(name);
+     build_job(stack_qw, scratch_qw);
+     g_ran = g_cache_intact = g_frames_in_stack = 0;
+-    spu_run_spurs_job(job_entry, 7, JOB_EA, 256);
++    spu_run_spurs_job_owned(job_entry, 7, JOB_EA, 256, 0x123400);
+     CHECK(g_ran);
+     CHECK(g_cache_intact);
+     CHECK(g_frames_in_stack);
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 6879b0e..a8785d6 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1702,13 +1702,10 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+     unsigned code = value >> 24;
+     /* No lv2 group: SPU code under SPURS. Only its user events route, through
+      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
+-    extern uint32_t spurs_port_queue(uint32_t port);
+-    if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
+-        if (code < 128) { static int n; if (PS3_LOG_FIRST(n, 16))
+-            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
+-                    code & 63, spu->image_id, value); }
+-        return 0;
+-    }
++    extern uint32_t spurs_port_queue(uint32_t owner, uint32_t port);
++    /* Raw/unowned SPUs use the ordinary interrupt-mailbox hook. Do not
++     * reinterpret their payloads as SPURS send_event requests. */
++    if (!spu->spu_group_id && (!spu->spurs_ea || code >= 128)) return 0;
+     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
+      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
+     if (code == 128 || code == 192) {
+@@ -1738,7 +1735,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+          * SPU_PORT_BIND_WAIT_MS, before the event is answered with ENOTCONN. Multistream's first request used
+          * to fail that way and end its SPU program. */
+         if (!spu->spu_group_id) {
+-            queue = spurs_port_queue(port);
++            queue = spurs_port_queue(spu->spurs_ea, port);
+         } else {
+             const ULONGLONG deadline = GetTickCount64() + SPU_PORT_BIND_WAIT_MS;
+             AcquireSRWLockExclusive(&s_spu_port_lock);
+diff --git a/tests/test_spurs_jobchain_resume.c b/tests/test_spurs_jobchain_resume.c
+index 195faa7..e7fa030 100644
+--- a/tests/test_spurs_jobchain_resume.c
++++ b/tests/test_spurs_jobchain_resume.c
+@@ -14,9 +14,9 @@
+  * binary dispatch (to count which jobs ran) and the completion-event push (to
+  * hold the walker still at a chosen point) are observed; nothing in the walker
+  * is replaced. */
+-#define spu_workload_dispatch_job fixture_dispatch_job
++#define spu_workload_dispatch_job_owned fixture_dispatch_job
+ #include "../libs/spurs/cellSpurs.c"
+-#undef spu_workload_dispatch_job
++#undef spu_workload_dispatch_job_owned
+ #include <assert.h>
+ #include <stdatomic.h>
+ 
+@@ -39,9 +39,10 @@ enum { SPURS = 0x0800, PORT = 0x0900, CHAIN = 0x1000, ROOT = 0x2000,
+ 
+ /* How many times each job descriptor was dispatched. */
+ static atomic_uint runs[32];
+-int fixture_dispatch_job(const uint8_t* image, uint32_t size, uint32_t job_ea, uint32_t desc)
++int fixture_dispatch_job(const uint8_t* image, uint32_t size, uint32_t job_ea, uint32_t desc, uint32_t owner)
+ {
+     (void)image; (void)size; (void)desc;
++    assert(owner == SPURS);
+     assert(job_ea >= JOBS && (job_ea - JOBS) / 0x80u < 32);
+     atomic_fetch_add(&runs[(job_ea - JOBS) / 0x80u], 1);
+     return 1;
+@@ -56,7 +57,8 @@ static atomic_int hold_mode;              /* 0 off, 1 next push, 2 END push */
+ static uint64_t hold_prev;                /* data2 of the last push since arming */
+ int sys_event_queue_push_by_id(uint32_t q, uint64_t src, uint64_t d1, uint64_t d2, uint64_t d3)
+ {
+-    (void)q; (void)src; (void)d1; (void)d3;
++    assert(q == QUEUE);
++    (void)src; (void)d1; (void)d3;
+     atomic_fetch_add(&pushes, 1);
+     int mode = atomic_load(&hold_mode), stop = mode == 1;
+     if (mode == 2) { stop = d2 == hold_prev; hold_prev = d2; }
+@@ -131,6 +133,11 @@ int main(void)
+ {
+     vm_base = calloc(1, ppu_vm_size); assert(vm_base);
+     assert(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)SPURS, QUEUE, (u8*)(uintptr_t)PORT, 1) == CELL_OK);
++    /* Another instance uses the same port; a chain must never notify it.
++     * Two ports on our queue still produce only one completion per job. */
++    assert(cellSpursAttachLv2EventQueue((CellSpurs*)0x3800, QUEUE+1, (u8*)(uintptr_t)PORT, 0)==CELL_OK);
++    vm_base[PORT]=17;
++    assert(cellSpursAttachLv2EventQueue((CellSpurs*)(uintptr_t)SPURS, QUEUE, (u8*)(uintptr_t)PORT, 0)==CELL_OK);
+     for (int i = 0; i < 16; i++) vm_write64(ROOT + 8u * i, END);
+     assert(cellSpursCreateJobChain(SPURS, CHAIN, ROOT, 256, 16, 0, 1, 0) == CELL_OK);
+ 
+diff --git a/tests/test_spurs_scheduler.c b/tests/test_spurs_scheduler.c
+index b1a4dc2..cf2ba15 100644
+--- a/tests/test_spurs_scheduler.c
++++ b/tests/test_spurs_scheduler.c
+@@ -36,6 +36,7 @@ static atomic_uint entered, produced, finished, release_consumer;
+ static atomic_uint consumer_lane,producer_lane;
+ static void finish(spu_context* c)
+ {
++    assert(c->spurs_ea == spu_ls_read32(c,0x1C4));
+     u32 ea=spu_ls_read32(c,0x1C4),wid=spu_ls_read32(c,0x1DC);
+     /* The manufactured guest removes itself from the runnable set. */
+     vm_write8(ea+0x80+wid,3);
+@@ -166,7 +167,7 @@ int main(void)
+     assert(atomic_load(&consumer_lane)!=atomic_load(&producer_lane));
+     unsigned port3=vm_read8(0x8010);
+     finalize(0x1000);assert(atomic_load(&canceled_queues)==(1u<<3));
+-    assert(!spurs_port_queue(port3));
++    assert(!spurs_port_queue(0x1000, port3));
+     puts("SPURS runnable producer / blocked consumer / BUSY immutability / join PASS");
+ 
+     /* Reinitialize the same EA after all handles and resident contexts retire. */
+diff --git a/tools/test_spurs_dispatch_owner.py b/tools/test_spurs_dispatch_owner.py
+new file mode 100644
+index 0000000..9edb302
+--- /dev/null
++++ b/tools/test_spurs_dispatch_owner.py
+@@ -0,0 +1,23 @@
++#!/usr/bin/env python3
++"""Actual async dispatch, ELF loading and context construction retain SPURS ownership."""
++import os
++import subprocess
++import tempfile
++from pathlib import Path
++from msvc_env import environ
++root = Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory(prefix='spurs-dispatch-owner-') as tmp:
++    temp = Path(tmp)
++    binary = temp / ('test.exe' if os.name == 'nt' else 'test')
++    source = root / 'runtime/spu/tests/test_spurs_dispatch_owner.c'
++    if os.name == 'nt':
++        cmd = [os.environ.get('CC', 'clang-cl'), '/nologo', '/W0', '/O1', '/UNDEBUG',
++               '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(root / 'include'),
++               '/I' + str(root / 'runtime'), '/I' + str(root / 'runtime/spu'),
++               str(source), '/Fe:' + str(binary)]
++    else:
++        cmd = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
++               '-I' + str(root / 'include'), '-I' + str(root / 'runtime'),
++               '-I' + str(root / 'runtime/spu'), str(source), '-pthread', '-o', str(binary)]
++    subprocess.run(cmd, cwd=temp, env=environ(), check=True)
++    subprocess.run([str(binary)], cwd=temp, env=environ(), check=True, timeout=20)
+diff --git a/tools/test_spurs_owner_ports.py b/tools/test_spurs_owner_ports.py
+new file mode 100644
+index 0000000..7e9426a
+--- /dev/null
++++ b/tools/test_spurs_owner_ports.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++"""Exercise the production SPURS port table without linking unrelated HLE modules."""
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++from msvc_env import environ
++
++root = Path(__file__).resolve().parents[1]
++source = (root / 'libs/spurs/cellSpurs.c').read_text(encoding='utf-8')
++start = source.index('/* The lv2 event queues')
++end = source.index('/* Validate guest backing', start)
++with tempfile.TemporaryDirectory(prefix='spurs-owner-ports-') as directory:
++    temp = Path(directory)
++    (temp / 'spurs_ports_under_test.inc').write_text(source[start:end], encoding='utf-8')
++    test = root / 'libs/spurs/tests/test_owner_ports.c'
++    binary = temp / ('test.exe' if os.name == 'nt' else 'test')
++    env = environ()
++    if os.name == 'nt':
++        command = [os.environ.get('CC', 'clang-cl'), '/nologo', '/W0', '/UNDEBUG',
++                   '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(root / 'include'),
++                   '/I' + str(temp), str(test), '/Fe:' + str(binary)]
++    else:
++        command = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
++                   '-I' + str(root / 'include'), '-I' + str(temp), str(test),
++                   '-pthread', '-o', str(binary)]
++    subprocess.run(command, cwd=temp, env=env, check=True)
++    subprocess.run([str(binary)], cwd=temp, check=True, timeout=15)
+diff --git a/tools/test_spurs_owner_routing.py b/tools/test_spurs_owner_routing.py
+new file mode 100644
+index 0000000..72b6556
+--- /dev/null
++++ b/tools/test_spurs_owner_routing.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++"""SPURS owner routing through production mailboxes and real LV2 queues.
++
++Extract only the SPURS binding/delivery functions to avoid linking unrelated
++HLE modules. Non-SPURS group and blocking-receive dependencies abort if called.
++The queue create/push/tryreceive/destroy/cancel implementation is linked whole.
++"""
++import os
++import platform
++import subprocess
++import tempfile
++from pathlib import Path
++from msvc_env import environ
++
++root = Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory(prefix='spurs-owner-routing-') as directory:
++    temp = Path(directory)
++    source = (root / 'libs/spurs/cellSpurs.c').read_text(encoding='utf-8')
++    start = source.index('/* The lv2 event queues')
++    end = source.index('/* Validate guest backing', start)
++    (temp / 'spurs_ports_under_test.inc').write_text(source[start:end], encoding='utf-8')
++    source = (root / 'runtime/syscalls/lv2_register.c').read_text(encoding='utf-8')
++    start = source.index('/* User-event ports are independent')
++    end = source.index('static int64_t sys_spu_thread_group_disconnect_event_handler', start)
++    source = source[start:end]
++    start = source.index('static int64_t sys_spu_thread_group_connect_event_all_threads_handler')
++    end = source.index('/* The interrupt mailbox', start)
++    (temp / 'spurs_delivery_under_test.inc').write_text(source[:start] + source[end:], encoding='utf-8')
++    env = environ()
++    test = root / 'libs/spurs/tests/test_owner_routing.c'
++    event = root / 'runtime/syscalls/sys_event.c'
++    obj = temp / 'event.obj'
++    binary = temp / ('test.exe' if os.name == 'nt' else 'test')
++    if os.name == 'nt':
++        common = [os.environ.get('CC', 'clang-cl'), '/nologo', '/W0', '/O1', '/Gy', '/Gw', '/UNDEBUG',
++                  '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(root), '/I' + str(root / 'include'),
++                  '/I' + str(root / 'runtime'), '/I' + str(temp)]
++        commands = [common + ['/c', str(event), '/Dsys_event_flag_set=audit_unused_flag_set', '/Fo:' + str(obj)],
++                    common + [str(test), str(obj), '/Fe:' + str(binary), '/link', '/OPT:REF']]
++    else:
++        common = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-ffunction-sections',
++                  '-fdata-sections', '-I' + str(root), '-I' + str(root / 'include'),
++                  '-I' + str(root / 'runtime'), '-I' + str(temp), '-pthread']
++        commands = [common + ['-c', str(event), '-Dsys_event_flag_set=audit_unused_flag_set', '-o', str(obj)],
++                    common + [str(test), str(obj), '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections', '-o', str(binary)]]
++    for command in commands:
++        subprocess.run(command, cwd=temp, env=env, check=True)
++    cases = ['single', 'distinct-ports', 'same-static', 'same-dynamic', 'reverse-order', 'throw-collision',
++             'duplicate-no-mutation', 'detach', 'finalize-helper', 'finalized-sender', 'reuse-with-detach',
++             'shared-queue-finalize', 'capacity', 'unknown-owner', 'full-queue', 'malformed-mailbox', 'concurrent', 'unowned-raw']
++    for case in cases:
++        subprocess.run([str(binary), case], cwd=temp, env=env, check=True, timeout=15)
++    print('PASS: all', len(cases), 'SPURS routing cases')
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -890,114 +890,97 @@
+     return CELL_OK;
+ }
+ 
+-/* The lv2 event queues the app attached to SPURS, and the port we handed back.
+- * A title may attach more than one (Tokyo Jungle attaches two), so keep them
+- * all -- storing a single id let the second attach hide the first. */
+-#define MAX_SPURS_QUEUES 8
++/* The lv2 event queues attached to each SPURS instance. Ports belong to an
++ * instance, not the process. Grow the binding table instead of limiting the
++ * entire process to eight (owner, port) pairs. All access holds this lock. */
+ #define SPURS_EVENT_PORT 0u
+ extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
+                                       uint64_t data1, uint64_t data2, uint64_t data3);
+ extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
+ extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
+-
+-static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
+-/* WHICH SPURS instance attached each queue. A title with more than one instance
+- * -- Tokyo Jungle boots one for its data install and keeps a second for audio --
+- * finalises them separately, and cancelling every queue on any Finalize kills
+- * the surviving instance's queues too. That reads to the title as "the SPU
+- * stopped answering": its sound engine's receives fail with ECANCELED and it
+- * tears itself down. Cancel only the queues the instance being finalised owns. */
+-static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
+-static int s_spurs_event_queue_n = 0;
++struct SpursPortBinding { u32 owner, queue; u8 port; };
++static struct SpursPortBinding* s_spurs_ports;
++static size_t s_spurs_event_queue_n, s_spurs_ports_capacity;
+ static SRWLOCK s_spurs_queue_lock = SRWLOCK_INIT;
+-static u32 s_spurs_port_queue[64];
+-
+-/* Release anyone blocked on the completion queues SPURS attached; see
+- * cellSpursFinalize. */
+-static void spurs_cancel_attached_queues(u32 spurs_ea)
++
++static int port_binding(u32 owner, u32 port)
++{
++    if (!owner || port >= 64) return -1;
++    for (size_t i = 0; i < s_spurs_event_queue_n; ++i)
++        if (s_spurs_ports[i].owner == owner && s_spurs_ports[i].port == port)
++            return (int)i;
++    return -1;
++}
++
++/* Release only queues that have no surviving owner. A shared queue still has
++ * a producer after one of its SPURS instances has stopped. */
++static void spurs_cancel_attached_queues(u32 owner)
+ {
+     AcquireSRWLockExclusive(&s_spurs_queue_lock);
+-    int keep = 0;
+-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+-        /* owner 0 means "attached before we tracked owners" -- cancel those on
+-         * any finalize, which is the old behaviour and the safe default. */
+-        u32 owner = s_spurs_event_queue_owner[i];
+-        if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
+-            u32 q = s_spurs_event_queue[i];
+-            for (u32 p = 0; p < 64; p++)
+-                if (s_spurs_port_queue[p] == q) s_spurs_port_queue[p] = 0;
+-            sys_event_queue_cancel_by_id(q);
+-        } else {
+-            s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
+-            s_spurs_event_queue_owner[keep] = owner;
+-            keep++;
+-        }
+-    }
++    for (size_t i = 0; i < s_spurs_event_queue_n; ++i) {
++        if (owner && s_spurs_ports[i].owner != owner) continue;
++        int surviving = 0;
++        for (size_t j = 0; j < s_spurs_event_queue_n; ++j)
++            if (s_spurs_ports[j].queue == s_spurs_ports[i].queue && owner &&
++                s_spurs_ports[j].owner != owner) { surviving = 1; break; }
++        if (!surviving) sys_event_queue_cancel_by_id(s_spurs_ports[i].queue);
++    }
++    size_t keep = 0;
++    for (size_t i = 0; i < s_spurs_event_queue_n; ++i)
++        if (owner && s_spurs_ports[i].owner != owner)
++            s_spurs_ports[keep++] = s_spurs_ports[i];
+     s_spurs_event_queue_n = keep;
++    if (!keep) { free(s_spurs_ports); s_spurs_ports = NULL; s_spurs_ports_capacity = 0; }
+     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+ }
+ 
+-/* SPU user-event port -> lv2 queue, for SPU code running under SPURS.
+- *
+- * A SPURS task signals the PPU with send_event(port, ...) exactly as a raw SPU
+- * thread does, but there is no lv2 SPU thread group to hold the port binding,
+- * so the lv2 delivery path had nowhere to look and dropped the event -- and
+- * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
+- * stalls on the first physics step that way (port 2), and the PPU step waits
+- * for it forever. */
+-uint32_t spurs_port_queue(uint32_t port)
++uint32_t spurs_port_queue(uint32_t owner, uint32_t port)
+ {
+     AcquireSRWLockShared(&s_spurs_queue_lock);
+-    u32 q = port < 64 ? s_spurs_port_queue[port] : 0;
++    int i = port_binding(owner, port);
++    u32 q = i < 0 ? 0 : s_spurs_ports[i].queue;
+     ReleaseSRWLockShared(&s_spurs_queue_lock);
+     return q;
+ }
+ 
+-s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
+-                                 s32 isDynamic)
++s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port, s32 isDynamic)
+ {
+     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
++    u32 owner = (u32)(uintptr_t)spurs;
++    u8* out = GUEST_PTR(port, u8*);
++    u32 p = *out;
++    if (!queue || (!isDynamic && p >= 64)) return CELL_SPURS_CORE_ERROR_INVAL;
+     AcquireSRWLockExclusive(&s_spurs_queue_lock);
+-    /* KEEP the queue id. SPURS signals the application through the queue it
+-     * attaches here, and this discarded it -- so nothing SPURS ever did could
+-     * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
+-     * kicks its job chain and then blocks on exactly that receive. */
+-    if (queue && s_spurs_event_queue_n < MAX_SPURS_QUEUES) {
+-        /* A previous cellSpursFinalize may have cancelled this queue. Attaching
+-         * gives it a producer again, so lift that -- otherwise a title that
+-         * tears its audio down and brings it back finds every receive failing. */
+-        sys_event_queue_uncancel_by_id(queue);
+-        int dup = 0;
+-        for (int i = 0; i < s_spurs_event_queue_n; i++)
+-            if (s_spurs_event_queue[i] == queue) dup = 1;
+-        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
+-                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
+-    }
+-
+-    u8* port_h = GUEST_PTR(port, u8*);
+-
+-    /* Static: the caller names the port in *port. Dynamic: pick a free one,
+-     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
+-     * and hand it back. This used to write 0 either way, so every attach
+-     * landed on port 0 and the SPU's real port number routed nowhere. */
+-    u32 p = *port_h;
+     if (isDynamic) {
+-        p = 64;
+-        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
+-        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
+-        if (p == 64) { ReleaseSRWLockExclusive(&s_spurs_queue_lock); return CELL_SPURS_CORE_ERROR_BUSY; }
+-        *port_h = (u8)p;
+-    } else if (p >= 64) {
+-        ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+-        return CELL_SPURS_CORE_ERROR_INVAL;
+-    } else if (s_spurs_port_queue[p]) {
++        for (u32 i = 0; i < 64; ++i) {
++            p = (16 + i) % 64;
++            if (port_binding(owner, p) < 0) break;
++        }
++    }
++    if (port_binding(owner, p) >= 0) {
+         ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+         return CELL_SPURS_CORE_ERROR_BUSY;
+     }
+-    s_spurs_port_queue[p] = queue;
+-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
+-           isDynamic ? " (dynamic)" : "");
++    if (s_spurs_event_queue_n == s_spurs_ports_capacity) {
++        size_t cap = s_spurs_ports_capacity ? s_spurs_ports_capacity * 2 : 8;
++        struct SpursPortBinding* grown = NULL;
++        if (cap > s_spurs_ports_capacity && cap <= INT32_MAX &&
++            cap <= SIZE_MAX / sizeof(*grown))
++            grown = realloc(s_spurs_ports, cap * sizeof(*grown));
++        if (!grown) {
++            ReleaseSRWLockExclusive(&s_spurs_queue_lock);
++            return CELL_SPURS_CORE_ERROR_NOMEM;
++        }
++        s_spurs_ports = grown; s_spurs_ports_capacity = cap;
++    }
++    size_t i = s_spurs_event_queue_n++;
++    s_spurs_ports[i].owner = owner;
++    s_spurs_ports[i].queue = queue;
++    s_spurs_ports[i].port = (u8)p;
++    sys_event_queue_uncancel_by_id(queue);
++    *out = (u8)p;
+     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
++    printf("[cellSpurs] AttachLv2EventQueue(owner=0x%08X queue=%u port=%u)\n", owner, queue, p);
+     return CELL_OK;
+ }
+ 
+@@ -1005,9 +988,9 @@
+ {
+     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+     AcquireSRWLockExclusive(&s_spurs_queue_lock);
+-    if (port < 64) s_spurs_port_queue[port] = 0;
++    int i = port_binding((u32)(uintptr_t)spurs, port);
++    if (i >= 0) s_spurs_ports[i] = s_spurs_ports[--s_spurs_event_queue_n];
+     ReleaseSRWLockExclusive(&s_spurs_queue_lock);
+-    printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
+     return CELL_OK;
+ }
+ 
+@@ -1375,7 +1358,7 @@
+                     /* Async: SPURS tasks are persistent workers — running them
+                      * inline would block this PPU thread forever (deadlock). */
+                     spu_workload_dispatch_task(host_elf, (uint32_t)sz,
+-                                               (uint32_t)(uintptr_t)context, taskset_ea, i);
++                                                (uint32_t)(uintptr_t)context, taskset_ea, i);
+             }
+             return CELL_OK;
+         }
+@@ -2744,6 +2727,7 @@
+     u32 entry_ea;     /* first command word EA */
+     u16 size_desc;
+     u16 max_grab;
++    u32 spurs_ea;             /* owning instance, captured at registration */
+     int run_count;
+     volatile long running;   /* 1 while a host thread walks this chain */
+     /* Where the chain stands between walks (see jc_thread). */
+@@ -2809,12 +2793,13 @@
+ }
+ 
+ /* Register (or re-register) a job chain handle. Shared by both Create forms. */
+-static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
++static s32 jc_register(u32 spurs_ea, u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+                        const char* who)
+ {
+     for (int i = 0; i < MAX_JOBCHAINS; i++) {
+         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
+             s_jobchains[i].jc_ea     = jc_ea;
++            s_jobchains[i].spurs_ea  = spurs_ea;
+             s_jobchains[i].entry_ea  = entry_ea;
+             s_jobchains[i].size_desc = size_desc;
+             s_jobchains[i].max_grab  = max_grab;
+@@ -2889,7 +2874,7 @@
+            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
+            name_ea ? (const char*)(vm_base + name_ea) : "-");
+ 
+-    s32 rc = jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
++    s32 rc = jc_register((u32)spurs_ea, (u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+                          "CreateJobChainWithAttribute");
+     jc_set_priority((u32)jc_ea, (u32)attr_ea + JCATTR_PRIORITY);
+     return rc;
+@@ -2926,7 +2911,7 @@
+         if (entry_ea && (u32)entry_ea < 0x10000000u)
+             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
+     }
+-    s32 rc = jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
++    s32 rc = jc_register((u32)spurs_ea, (u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+                          (u16)maxGrabbedJob, "CreateJobChain");
+     jc_set_priority((u32)jc_ea, (u32)prio_ea);
+     return rc;
+@@ -2957,7 +2942,7 @@
+     JH_SIZE          = 0x30,
+ };
+ 
+-static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
++static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc, u32 spurs_ea)
+ {
+     u64 ea_bin_raw = vm_read64(job_ea + JH_EA_BINARY);
+     u32 ea_bin     = (u32)(ea_bin_raw & ~7ull);          /* low 3 bits = flags */
+@@ -2990,7 +2975,7 @@
+      * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
+      * Synchronous by design: a job runs to completion, and the chain's own
+      * NEXT/CALL/RET commands are what order them. */
+-    spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
++    spu_workload_dispatch_job_owned(vm_base + ea_bin, size_bin, job_ea, size_desc, spurs_ea);
+ }
+ 
+ /* Walk one chain's command stream. Bounded: a malformed or self-looping stream
+@@ -3204,19 +3189,22 @@
+         d3 = g_spurs_job_mbox_intr; (void)d3;
+         g_spurs_job_mbox_valid = 0;
+     }
+-    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+-        int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
+-                                            SPURS_EVENT_PORT, jc_ea, d2,
+-                                            d3_probe_valid
+-                                                ? spurs_event_data3_probe()
+-                                                : (answers_a_count ? mbox : 0));
+-        static int n = 0;
+-        if (PS3_LOG_FIRST(n, 8))
+-            printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
+-                   "(data2=%llu rc=%d)\n",
+-                   jc_ea, job_index, s_spurs_event_queue[i],
+-                   (unsigned long long)d2, rc);
+-    }
++    u32 owner = 0;
++    for (int i = 0; i < MAX_JOBCHAINS; ++i)
++        if (s_jobchains[i].jc_ea == jc_ea) { owner = s_jobchains[i].spurs_ea; break; }
++    AcquireSRWLockShared(&s_spurs_queue_lock);
++    for (size_t i = 0; i < s_spurs_event_queue_n; ++i) {
++        if (!owner || s_spurs_ports[i].owner != owner) continue;
++        int duplicate = 0;
++        for (size_t j = 0; j < i; ++j)
++            if (s_spurs_ports[j].owner == owner &&
++                s_spurs_ports[j].queue == s_spurs_ports[i].queue) { duplicate = 1; break; }
++        if (duplicate) continue;
++        sys_event_queue_push_by_id(s_spurs_ports[i].queue, SPURS_EVENT_PORT, jc_ea, d2,
++                                  d3_probe_valid ? spurs_event_data3_probe() :
++                                  (answers_a_count ? mbox : 0));
++    }
++    ReleaseSRWLockShared(&s_spurs_queue_lock);
+ }
+ 
+ /* Where a walk stopped. halted: on an END/RET/ABORT word (cmd), which the next
+@@ -3264,7 +3252,7 @@
+         if (cmd != 0 && op == 0) {                    /* JOB */
+             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+             int idx = jobs++;
+-            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
++            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc, s_jobchains[slot].spurs_ea);
+             idle = 0;                    /* real work: the chain is healthy */
+             /* Signal per JOB, not per lap. The application waits once for each
+              * unit of work it queued -- this title notified the guard 7 times
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -400,6 +400,7 @@
+     int                 image_id;
+     uint32_t            r3[4];        /* captured race-free at dispatch time */
+     int                 have_r3;
++    uint32_t            spurs_ea;     /* captured owner, never inferred in a worker */
+     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
+     uint32_t            taskid;
+ #ifndef _WIN32
+@@ -644,9 +645,9 @@
+     for (int i = 0; i < n_start; i++) {
+         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];   /* legacy readers */
+-        spu_workload_dispatch_task(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i],
+-                                   taskset_ea, start_t[i]);
++        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
++        spu_workload_dispatch_task(vm_base + start_elf[i], (uint32_t)start_sz[i],
++                                   start_ctx[i], taskset_ea, start_t[i]);
+     }
+     s_ts_held = 0; ts_unlock();
+ }
+@@ -661,6 +662,8 @@
+ 
+ static void spu_async_run(spu_async_job* j)
+ {
++    spu_run_opts task_opts = {0};
++    task_opts.spurs_ea = j->spurs_ea;
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+@@ -719,10 +722,9 @@
+                  * ptr (LS[0x1C0]) was a hardcoded 0x40009D00 that mismatched the game's
+                  * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+-                extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+-                if (g_ydkj_real_taskset_ea)
+-                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+-                uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
++                if (j->taskset_ea)
++                    spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
++                uint32_t inst = j->spurs_ea ? j->spurs_ea : 0x40009D00u;
+                 uint8_t* p = ls + 0x1C0;
+                 p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
+                 p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
+@@ -733,7 +735,7 @@
+                  * (Declared by spu_lifted_job.h -- a local extern re-declaration
+                  * here conflicts with the header's static inline under clang.) */
+                 int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
+-                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, 0);
++                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, &task_opts);
+                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
+                 fflush(stderr);
+                 free(ls); free(j); return;
+@@ -749,13 +751,12 @@
+              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
+             if (j->image_id == 22 && !ps3_env_once("YDKJ_NO_CRI_CTX")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+-                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+-                if (g_ydkj_real_taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")) {
++                if (j->taskset_ea && !ps3_env_once("YDKJ_MINIMAL_CTX")) {
+                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
+                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
+                      * so the cri leaf reads valid data instead of my planted guesses. */
+-                    uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
++                    uint64_t elf = spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
+                     /* --- Golden-reference context fields for the CRI task, recovered from a
+                      * WORKING RPCS3 SPU-LS snapshot via caner's rpcs3-guest-memory-dumper fork
+                      * (github.com/canersaka/rpcs3-guest-memory-dumper): YDKJ BLUS30569, SPU0
+@@ -791,7 +792,7 @@
+                       if ((_e=ps3_env_once("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                           LSBE32(0x2798,v); LSBE32(0x279C,v); } }
+                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
+-                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
++                            j->taskset_ea, j->taskid, (unsigned long long)elf);
+                 } else {
+                     LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
+                     LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
+@@ -908,11 +909,10 @@
+                 if (ps3_env_once("LBP_REAL_POLICY") && j->taskset_ea) {
+                     extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
+                                                               uint64_t,uint32_t,uint8_t*,uint32_t);
+-                    /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
++                    /* The probe uses the same captured owner as the task. */
+                     uint32_t ts = j->taskset_ea;
+-                    uint32_t spurs_ea = 0;
++                    uint32_t spurs_ea = j->spurs_ea;
+                     if (vm_base) { const uint8_t* t = vm_base + ts;
+-                        spurs_ea = RDBE32(t, 0x64);
+                         /* Why did the policy exit without dispatching? Dump the task
+                          * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
+                         fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
+@@ -947,7 +947,7 @@
+             }
+             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
+             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+-                                                1, j->have_r3 ? j->r3 : 0, 0);
++                                                1, j->have_r3 ? j->r3 : 0, &task_opts);
+             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
+              * the kernel re-enters it when work is signaled. Our HLE runs it once,
+              * so it polls the (concurrently PPU-updated) eaContext, finds no work,
+@@ -970,7 +970,7 @@
+                     uint32_t e2 = 0;
+                     if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
+                     rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+-                                                1, j->have_r3 ? j->r3 : 0, 0);
++                                                1, j->have_r3 ? j->r3 : 0, &task_opts);
+                     if (g_cri_video_dma) {
+                         fprintf(stderr, "[cri] RESUME: cri task DECODED real video (attempt %d)\n", attempt);
+                         break;
+@@ -1058,8 +1058,13 @@
+ static void spu_async_pool_run(void* p) { spu_async_run((spu_async_job*)p); }
+ #endif
+ 
+-int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+-                              uint32_t job_ea, uint32_t job_desc_size)
++int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size, uint32_t job_ea, uint32_t job_desc_size)
++{
++    return spu_workload_dispatch_job_owned(image, image_size, job_ea, job_desc_size, 0);
++}
++
++int spu_workload_dispatch_job_owned(const uint8_t* image, uint32_t image_size,
++                              uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea)
+ {
+     if (!image || image_size == 0) return 0;
+ 
+@@ -1120,7 +1125,7 @@
+     if (s_prof < 0) { const char* e = ps3_env_once("SPU_JOBPROF"); s_prof = e ? atoi(e) : 0; }
+     struct timespec t0, t1;
+     if (s_prof) timespec_get(&t0, TIME_UTC);
+-    int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
++    int rc = spu_run_spurs_job_owned(fn, image_id, job_ea, job_desc_size, spurs_ea);
+     if (s_prof) {
+         static double acc[64], last; static unsigned cnt[64];
+         timespec_get(&t1, TIME_UTC);
+@@ -1604,35 +1609,14 @@
+     return 0;
+ }
+ 
+-static int spu_workload_dispatch_async_as(const uint8_t* image, uint32_t image_size,
+-                                          uint32_t args_ea, uint32_t taskset_ea,
+-                                          uint32_t taskid);
+-
+-/* The taskset and task id travel as arguments: the one-slot globals
+- * g_ydkj_real_taskset_ea/g_ydkj_real_taskid are written by cellSpursCreateTask
+- * on a PPU thread and by spu_taskset_task_exited on whichever SPU thread just
+- * finished a task, each some time before it dispatches. With both at once (Havok
+- * creates its per-step tasks from the PPU while its SPU tasks exit and start the
+- * next) one of them dispatched the other's task id: the wrong slot was marked
+- * running and later cleared, a task never ran, and the physics step waited on
+- * its semaphore forever. */
++int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
++                                uint32_t args_ea)
++{
++    return spu_workload_dispatch_task(image, image_size, args_ea, 0, 0);
++}
++
+ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
+-{
+-    return spu_workload_dispatch_async_as(image, image_size, args_ea, taskset_ea, taskid);
+-}
+-
+-int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+-                                uint32_t args_ea)
+-{
+-    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+-    return spu_workload_dispatch_async_as(image, image_size, args_ea,
+-                                          g_ydkj_real_taskset_ea, g_ydkj_real_taskid);
+-}
+-
+-static int spu_workload_dispatch_async_as(const uint8_t* image, uint32_t image_size,
+-                                          uint32_t args_ea, uint32_t taskset_ea,
+-                                          uint32_t taskid)
+ {
+     if (!image || image_size == 0) return 0;
+ 
+@@ -1673,10 +1657,16 @@
+     if (!j) return 0;
+     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
+     j->fn = fn; j->image_id = image_id;
+-    /* Capture the taskset+taskid NOW, not in the async thread: reading the
+-     * single-slot globals later raced the next CreateTask -- with two audio
+-     * tasks that made both run task 1's descriptor. */
+-    j->taskset_ea = taskset_ea; j->taskid = taskid;
++    j->taskset_ea = taskset_ea; j->taskid = taskid; j->spurs_ea = 0;
++    /* CellSpursTaskset stores its owning instance as BE u64 at +0x60.
++     * Capture it now, not from mutable global task/instance scratch fields. */
++    extern uint32_t ppu_vm_size;
++    if (vm_base && taskset_ea && (uint64_t)taskset_ea + 0x68 <= 0x100000000ull &&
++        (!ppu_vm_size || (uint64_t)taskset_ea + 0x68 <= ppu_vm_size)) {
++        const uint8_t* p = vm_base + taskset_ea + 0x64;
++        j->spurs_ea = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
++                      (uint32_t)p[2] << 8 | p[3];
++    }
+     /* Mark the task running NOW, not when its thread starts: in that gap another
+      * task's exit saw it ready-but-not-running and started it a second time
+      * (Twisted Metal's level-load inflate tasks each ran twice, concurrently). */
+diff --git a/runtime/spu/spu_workload.h b/runtime/spu/spu_workload.h
+--- a/runtime/spu/spu_workload.h
++++ b/runtime/spu/spu_workload.h
+@@ -113,6 +113,8 @@
+  * assume 256). Returns 0 if the job ran, negative if it could not be staged. */
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size);
++int spu_run_spurs_job_owned(spu_lifted_entry_fn entry, int image_id,
++                      uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea);
+ 
+ /* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
+  * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
+@@ -122,6 +124,8 @@
+  * and ran, 0 if none is registered for this binary. */
+ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+                               uint32_t job_ea, uint32_t job_desc_size);
++int spu_workload_dispatch_job_owned(const uint8_t* image, uint32_t image_size,
++                              uint32_t job_ea, uint32_t job_desc_size, uint32_t spurs_ea);
+ 
+ /* Load a 32-bit big-endian SPU ELF image into a 256 KB local store: each PT_LOAD
+  * segment is copied to its p_vaddr (BSS zero-filled). Returns 1 on success and
+@@ -149,14 +153,11 @@
+ /* Same, but runs the SPU job on its own detached host thread so the PPU caller
+  * is not blocked. Required for persistent SPURS service/worker tasks that loop
+  * waiting on PPU-side signals (running them inline deadlocks). */
++/* SPURS task identity is captured before handing work to a host worker. */
++int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
++                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                 uint32_t args_ea);
+-
+-/* Same as spu_workload_dispatch_async for a SPURS task: the taskset and task id
+- * it runs as are passed in, not read from the g_ydkj_real_* globals, which two
+- * threads starting tasks at once overwrite under each other. */
+-int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+-                               uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+ 
+ /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
+ unsigned spu_workload_count(void);
