@@ -50,6 +50,8 @@
 #include "rsx_d3d12_shader_cache.h"
 #include "rsx_d3d12_pipeline_cache.h"
 #include "rsx_d3d12_null_srv.h"
+#include "rsx_d3d12_cpu_readback.h"
+#include "spu_coherency.h"
 #define D3DCompile rsx_d3d12_compile_cached
 
 /* Link libraries */
@@ -134,6 +136,7 @@ typedef struct {
     u32 cb_slot;
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
+    u32 rt_pitch;       /* guest primary colour pitch, for explicit CPU readback */
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
     u32 rt_fmt;         /* RSX surface colour format (SET_SURFACE_FORMAT [4:0]) */
     u32 zeta_off;       /* depth surface (SET_SURFACE_ZETA_OFFSET) when the surface has one */
@@ -1647,10 +1650,12 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
  * Self-contained: waits, resets the frame command list, copies, executes,
  * waits, maps. `prior` is the resource's current tracked state (restored after
  * the copy so the caller's state tracking stays valid). */
-static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
-                               D3D12_RESOURCE_STATES prior, u32 fi, const char* path)
+typedef int (*readback_sink)(void*, const void*, u32, u32, u32, u32);
+static int readback_surface(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
+                               D3D12_RESOURCE_STATES prior, u32 fi, readback_sink sink, void* context)
 {
-    if (!res || !w || !h) return;
+    if (!res || !w || !h) return 0;
+    int result = 0;
     u32 bpp = (dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
               (dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
     u32 pitch = (w * bpp + 255) & ~255u;
@@ -1666,11 +1671,12 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
             &IID_ID3D12Resource, (void**)&rb)) || !rb)
-        return;
+        return 0;
 
     wait_for_gpu();
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    if (FAILED(s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi])) ||
+        FAILED(s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL)))
+        goto done;
 
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1690,37 +1696,103 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     src.pResource = res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
     s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
-        /* TEXUP_DBG=1: texture uploads per second. A cache that misses every
-         * draw re-uploads megabytes per frame, which is the kind of GPU work
-         * that trips a 2-second TDR while looking like nothing in a draw count. */
-        { static int td = -1; if (td < 0) td = getenv("TEXUP_DBG") ? 1 : 0;
-          if (td) { static long long n = 0, bytes = 0; static clock_t t0 = 0;
-              n++; bytes += (long long)pitch * h;
-              const clock_t now = clock();
-              if (!t0) t0 = now;
-              if (now - t0 >= CLOCKS_PER_SEC) {
-                  fprintf(stderr, "[TEXUP] %lld uploads/s, %.1f MB/s\n",
-                          n, bytes / 1048576.0);
-                  n = 0; bytes = 0; t0 = now; } } }
-
     if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE) {
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter  = prior;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
     }
 
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    if (FAILED(s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list))) goto done;
     ID3D12CommandList* cl[] = { (ID3D12CommandList*)s_d3d.cmd_list };
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cl);
     wait_for_gpu();
 
     void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &mp)) && mp) {
-        cap_write_bmp(path, mp, w, h, pitch, dxgi);
+        result = sink(context, mp, w, h, pitch, dxgi);
         D3D12_RANGE wr = {0, 0};
         rb->lpVtbl->Unmap(rb, 0, &wr);
     }
+done:
     rb->lpVtbl->Release(rb);
+    return result;
+}
+
+static int readback_bmp_sink(void* path, const void* pixels, u32 w, u32 h, u32 pitch, u32 dxgi)
+{
+    cap_write_bmp((const char*)path, pixels, w, h, pitch, dxgi);
+    return 1;
+}
+static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
+                               D3D12_RESOURCE_STATES prior, u32 fi, const char* path)
+{
+    readback_surface(res, w, h, dxgi, prior, fi, readback_bmp_sink, (void*)path);
+}
+
+/* Until local-memory GPU/CPU coherence is general, a title can request readback
+ * of its CPU-consumed surface size. Primary linear RGBA8 draws and 1:1 copy
+ * destinations qualify; sampled textures and cached stale RTs do not. Parse
+ * once, and skip readback work and GPU waits entirely in ordinary frames. */
+static rsx_cpu_readback_size cpu_readback_size(void)
+{
+    static int initialized;
+    static rsx_cpu_readback_size size;
+    if (!initialized) {
+        initialized = 1;
+        size = rsx_cpu_readback_parse(getenv("PS3RECOMP_D3D12_CPU_READBACK"));
+    }
+    return size;
+}
+typedef struct { u32 offset, pitch; } CPUReadbackTarget;
+static CPUReadbackTarget s_cpu_readbacks[MAX_OFF_RTS];
+static u32 s_cpu_readback_count;
+static void cpu_readback_queue(u32 offset, u32 w, u32 h, u32 format, u32 pitch)
+{
+    if (!offset || !rsx_cpu_readback_matches(cpu_readback_size(), w, h, format, pitch)) return;
+    u32 i;
+    for (i = 0; i < s_cpu_readback_count && s_cpu_readbacks[i].offset != offset; ++i) {}
+    if (i == MAX_OFF_RTS) return;
+    if (i == s_cpu_readback_count) ++s_cpu_readback_count;
+    s_cpu_readbacks[i].offset = offset;
+    s_cpu_readbacks[i].pitch = pitch;
+}
+typedef struct { u32 guest, pitch; } CPUReadbackDest;
+static int readback_guest_sink(void* context, const void* pixels, u32 w, u32 h, u32 pitch, u32 dxgi)
+{
+    extern u8* vm_base;
+    extern u32 ppu_vm_size;
+    CPUReadbackDest* dest = (CPUReadbackDest*)context;
+    const u64 end = (u64)dest->guest + (u64)(h-1) * dest->pitch + (u64)w * 4;
+    const u64 limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    if (!vm_base || !dest->guest || dxgi != DXGI_FORMAT_R8G8B8A8_UNORM || end > limit) return 0;
+    spu_lockline_lock();
+    int result = rsx_cpu_readback_argb(vm_base + dest->guest, dest->pitch, pixels, pitch, w, h);
+    if (result) {
+        for (u64 line = dest->guest & ~127u; line < end; line += 128)
+            if (spu_coh_is_reserved((u32)line)) spu_coh_notify_write((u32)line);
+    }
+    spu_lockline_unlock();
+    return result;
+}
+static void cpu_readback_written_surfaces(u32 fi)
+{
+    const u32 count = s_cpu_readback_count;
+    s_cpu_readback_count = 0;
+    if (!count) return;
+    const rsx_cpu_readback_size size = cpu_readback_size();
+    for (u32 i = 0; i < count; ++i) {
+        const CPUReadbackTarget* target = &s_cpu_readbacks[i];
+        for (int slot = 0; slot < MAX_OFF_RTS; ++slot) {
+            OffRT* rt = &s_d3d.off_rt[slot];
+            if (!rt->res || rt->off != target->offset || rt->w != size.width || rt->h != size.height ||
+                rt->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) continue;
+            CPUReadbackDest dest = {cellGcmResolveLocated(1, rt->off), target->pitch};
+            if (readback_surface(rt->res, rt->w, rt->h, rt->dxgi, rt->st, fi, readback_guest_sink, &dest))
+                fprintf(stderr, "[D3D12] CPU surface readback 0x%08X %ux%u pitch=%u\n",
+                        dest.guest, rt->w, rt->h, dest.pitch);
+            break;
+        }
+    }
 }
 
 static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
@@ -3733,6 +3805,7 @@ static u32 rec_fp_ctrl(void)
 static void rec_zeta(D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
+    dr->rt_pitch = st ? st->surface_color_pitch[st->color_target == 2 ? 1 : 0] : 0;
     dr->zeta_off = 0;
     dr->no_color = 0;
     if (!st || !((st->surface_format >> 5) & 7u)) return;
@@ -4786,6 +4859,7 @@ static void render_frame(void)
      * texture can resolve to it below, whatever the op order). Depth surfaces
      * too, and the colour copy of each one a draw samples: both settle their
      * size here, before any draw's SRV window points at them. */
+    s_cpu_readback_count = 0;
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
@@ -5257,6 +5331,7 @@ static void render_frame(void)
                         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
                         off_rt_transition(op->to, D3D12_RESOURCE_STATE_COPY_DEST);
                         s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, dst->res, b.Transition.pResource);
+                        cpu_readback_queue(dst->off, dst->w, dst->h, 0x108u, op->pitch);
                         off_rt_transition(op->to, prior);
                         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
                         b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -5269,6 +5344,7 @@ static void render_frame(void)
                     off_rt_transition(op->from,D3D12_RESOURCE_STATE_COPY_SOURCE);
                     off_rt_transition(op->to,D3D12_RESOURCE_STATE_COPY_DEST);
                     s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list,dst->res,src->res);
+                    cpu_readback_queue(dst->off, dst->w, dst->h, 0x108u, op->pitch);
                     off_rt_transition(op->from,before_src);
                     off_rt_transition(op->to,before_dst);
                 }
@@ -5571,6 +5647,8 @@ static void render_frame(void)
                       s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
                           s_d3d.cmd_list, bn, brh, FALSE, &cur_dsv);
                   } }
+                if (!dr->no_color && dr->cmask && dr->vertex_count)
+                    cpu_readback_queue(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt, dr->rt_pitch);
                 if (dr->indexed) {
                     if (!ib_bound) {
                         D3D12_INDEX_BUFFER_VIEW ibv;
@@ -5987,6 +6065,8 @@ skip_dump_consider: ;
         }
         s_rtsave_state = 0;
     }
+
+    cpu_readback_written_surfaces(fi);
 
     /* rsxcap: snapshot whole frames (backbuffer + every offscreen RT + a draw
      * manifest) at RSX_CAP=start[:count[:stride]] frame_counts. Runs before the
