@@ -1,7 +1,7 @@
 from pathlib import Path
 import os,sys,subprocess,json,hashlib,time,resource
 R=Path(__file__).resolve().parent;mode=sys.argv[1];O=R/'sigbus-evidence'/mode;O.mkdir(parents=True,exist_ok=True)
-if mode=='paired':
+if mode in ['paired','paired-signal']:
  source=(R/'tests/test_ppu_prio_start.c').read_text();summary=[]
  prefix='''#include <sys/mman.h>
 #include <stddef.h>
@@ -16,6 +16,18 @@ static int observe_protect(void* a,size_t n,int prot) {
  int len=snprintf(b,sizeof b,"PROTECT vm=%p addr=%p bytes=%zu prot=%d rc=%d errno=%d\n",vm_base,a,n,prot,rc,err);write(2,b,len);errno=err;return rc;
 }
 '''
+ if mode=='paired-signal':
+  suffix+=r'''
+#include <signal.h>
+#include <sys/ucontext.h>
+#include <execinfo.h>
+static void fault(int sig,siginfo_t* si,void* v) {
+ ucontext_t* u=v;uintptr_t pc=u->uc_mcontext->__ss.__pc;char b[1024];
+ int n=snprintf(b,sizeof b,"SIGNAL sig=%d code=%d addr=%p pc=%llx x8=%llx x9=%llx INSN=%08x,%08x,%08x,%08x\n",sig,si->si_code,si->si_addr,(unsigned long long)pc,u->uc_mcontext->__ss.__x[8],u->uc_mcontext->__ss.__x[9],((unsigned*)pc)[0],((unsigned*)pc)[1],((unsigned*)pc)[2],((unsigned*)pc)[3]);write(2,b,n);
+ void* bt[32];n=backtrace(bt,32);backtrace_symbols_fd(bt,n,2);_exit(128+sig);
+}
+__attribute__((constructor)) static void install(void) {struct sigaction sa={0};sa.sa_sigaction=fault;sa.sa_flags=SA_SIGINFO;sigaction(SIGBUS,&sa,0);sigaction(SIGSEGV,&sa,0);}
+'''
  fixed=source.replace('vm_base = calloc(1, 0x10000); assert(vm_base);','vm_base = mmap(NULL, 0x200000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0); assert(vm_base != MAP_FAILED);').replace('next_addr = 0x10000000u; g_vm_stack_alloc.region_end = 0xA0000000u;','next_addr = 0x10000u; g_vm_stack_alloc.region_end = 0x200000u;').replace('free(vm_base);','assert(munmap(vm_base, 0x200000) == 0);')
  for label,content in [('original',source),('owned',fixed)]:
   # The copied fixture retains its relative runtime include by using an absolute path.
@@ -27,6 +39,12 @@ static int observe_protect(void* a,size_t n,int prot) {
    env=dict(os.environ);env.pop('PS3_PRIO_START',None)
    if i%2:env['PS3_PRIO_START']='1'
    p=subprocess.run([str(b)],env=env,capture_output=True,text=True,timeout=60);(O/f'{label}-{i:03d}.log').write_text(p.stdout+p.stderr);summary.append(dict(variant=label,case=i,on=bool(i%2),exit=p.returncode));print(label,i,p.returncode,flush=True)
+ if mode=='paired-signal':
+  import re
+  pcs=sorted(set(re.findall(r'pc=([0-9a-f]+)', ''.join(p.read_text() for p in O.glob('original-*.log')))))
+  for pc in pcs:
+   cmd=['lldb','--batch',str(O/'original'),'-o','settings set target.disable-aslr false','-o','b main','-o','run','-o','image list','-o','disassemble --start-address 0x'+pc+' --count 16']
+   q=subprocess.run(cmd,capture_output=True,text=True,timeout=60);(O/('instruction-'+pc+'.log')).write_text(q.stdout+q.stderr)
  (O/'results.json').write_text(json.dumps(summary,indent=2));print('COLLECTION ONLY; original faults preserved');raise SystemExit(0)
 env={k:v for k,v in os.environ.items() if k not in ['PS3_PRIO_START','PS3_PRIO_TEST_HOST_DELAY_MS']}
 flags=['clang','-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections','-Iinclude','-Iruntime','-Iruntime/syscalls']
