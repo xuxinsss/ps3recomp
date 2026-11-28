@@ -20,11 +20,12 @@ static long long dns(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t)
 static void mark(unsigned id,unsigned event) {if(id<65)atomic_store_explicit(&dt[id][event],dns(),memory_order_relaxed);}
 static void reason(unsigned id,int why) {mark(id,D_OBSERVE);atomic_store(&dr[id],why);}
 static void nap(unsigned id,long long begin) {long long elapsed=dns()-begin;if(id<65){atomic_fetch_add(&nap_sum[id],elapsed);atomic_fetch_add(&nap_n[id],1);if(elapsed>atomic_load(&max_nap[id])){atomic_store(&max_nap[id],elapsed);atomic_store(&nap_at[id],begin);}}}
+static int get_qos(void) {qos_class_t q;int rel;int rc=pthread_get_qos_class_np(pthread_self(),&q,&rel);return rc ? -rc : (int)q;}
 static void setup_profile(void) {
  const char *p=getenv("DIAG_QOS");int rc=0;
  if(p && !strcmp(p,"background"))rc=pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND,0);
  if(p && !strcmp(p,"interactive"))rc=pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
- printf("PROFILE qos=%u change_rc=%d\n",(unsigned)pthread_get_qos_class_np(pthread_self(),NULL),rc);
+ printf("PROFILE qos=%u change_rc=%d\n",(unsigned)get_qos(),rc);
  if(rc)exit(88);
 }
 static void dump(unsigned id,unsigned long long body,long long begin,long long end) {
@@ -49,7 +50,7 @@ runtime=once(runtime,'    /* Mark as finished */\n    table_lock();','    /* Mar
 runtime=once(runtime,'        info->state = PPU_THREAD_STATE_FREE;','        mark(info->ctx.thread_id,D_FREE);\n        info->state = PPU_THREAD_STATE_FREE;')
 # Resolve quoted local includes from the copied runtime's original directory.
 runtime=re.sub(r'#include "([^"]+)"',lambda m:'#include "'+(root/'runtime/syscalls'/m[1]).resolve().as_posix()+'"' if (root/'runtime/syscalls'/m[1]).exists() else m[0],runtime)
-source=once(source,'    switch (ctx->gpr[3]) {','    mark(ctx->thread_id,D_ENTRY);atomic_store(&dq[ctx->thread_id],(int)pthread_get_qos_class_np(pthread_self(),NULL));\n    switch (ctx->gpr[3]) {')
+source=once(source,'    switch (ctx->gpr[3]) {','    mark(ctx->thread_id,D_ENTRY);atomic_store(&dq[ctx->thread_id],(int)get_qos());\n    switch (ctx->gpr[3]) {')
 assert source.count('        sleep_ms(PUBLISH_DELAY_MS);')==2
 source=source.replace('        sleep_ms(PUBLISH_DELAY_MS);','        mark(ctx->thread_id,D_SLEEP_BEGIN);sleep_ms(PUBLISH_DELAY_MS);mark(ctx->thread_id,D_SLEEP_END);')
 source=source.replace('        __atomic_store_n(&g_published, 1, __ATOMIC_RELAXED);','        __atomic_store_n(&g_published, 1, __ATOMIC_RELAXED);mark(ctx->thread_id,D_PUBLISH);')
@@ -86,3 +87,4 @@ try:
 finally:
  for p in loads:p.terminate()
  for p in loads:p.wait(timeout=10)
+
