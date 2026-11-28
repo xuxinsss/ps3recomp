@@ -1,0 +1,162 @@
+Eternal Sonata / SDK v0.20.0: fix inventory and upstream assessment
+2026-11-28
+
+Scope
+Exact base: d81c393ee72db80ef89aa4464b23c466edda44b0 (v0.20.0).
+Read-only upstream check: e85647a33ce5f9391788f0e3f52ab395a7fe6a89.
+The upstream changes since the base touch ppu_sysprx.cpp and sys_event.c;
+they do not contain the corrections listed below. This is a source comparison,
+not a claim that the whole compatibility branch can be merged upstream.
+No upstream PR, comment or push was made. User requested assessment and fork CI.
+
+The production branch deliberately restores a preserved legacy D3D12 backend.
+It replaces overlapping v0.20 renderer changes. Do NOT propose the entire
+branch as one upstream PR. Extract small changes against current upstream and
+retain the original renderer architecture there.
+
+Strong candidates for small, independently reviewed PRs
+
+1. Missing save slots returning success (69c77a9508f5).
+   Global flOw compatibility converted NODATA to CELL_OK; a subsequent missing
+   slot reused the previous preview. Preserve the error by default and require
+   PS3_SAVEDATA_AUTOLOAD_NODATA_OK=1 for the legacy behavior.
+   Verified callbacks, real file round-trip, existing-then-missing slots and
+   compatibility opt-in, plus actual save/overwrite/restart/load/movement.
+   Before upstream: document the flOw launcher migration and verify that title;
+   the opt-in test is not an actual flOw game regression.
+
+2. Fragment programs longer than 4 KiB (1ad9de441835).
+   A 4304-byte program was truncated, corrupting the bridge material. Complete
+   length/hash/texture mask/constants/decompilation and offline preparation now
+   agree. Reject truncated inline constants. Keep the ordinary 4 KiB fast path;
+   VirtualQuery belongs only on an extended scan.
+   Synthetic tail instructions + real HLSL compilation + cache reuse, existing
+   decoder regression and 60 bounded game captures were verified.
+   Extract shared decoder bounds from legacy-backend integration when proposing.
+
+3. Sampler minimum/maximum LOD (048366b9fa15).
+   Ignored guest LOD bounds selected the wrong vegetation mask mip and produced
+   thick dark fringes. Decode fractional bounds; preserve guest alpha/blending.
+   Register-pair/boundary tests and matching forest cameras support this fix.
+   Small correctness change, but port it to the current upstream sampler.
+
+4. FIFO 2D/3D method isolation (0331a23).
+   Mirroring 2D method offsets into NV4097 state corrupts unrelated 3D registers.
+   Keep 3D routes and driver methods; actual FIFO fixture covers collisions,
+   subchannel selection and callbacks. Portable fixture runs on POSIX; the
+   Windows wrapper explicitly skips its POSIX-linkage fixture.
+
+5. Windows opt-in Vulkan entry and clock (cc32ef7).
+   Project selection must honor PS3RECOMP_RSX_VULKAN on Windows; compiled
+   present hooks need QPC timing. No asynchronous presentation is enabled.
+   Windows Vulkan game build/boot/audio were verified. Upstream needs the
+   option-on/off template builds in addition to ordinary runtime CI.
+
+High value, but additional isolation/coverage is needed
+
+6. SPURS event-port ownership (19caa05).
+   A second instance requesting static port 1 failed BUSY, blocking audio init.
+   Owner-scoped allocation/detach/cancellation restored Multistream and PCM.
+   Tests cover duplicate rejection, two owners and dynamic allocations.
+   The legacy spurs_port_queue(port) getter still lacks owner identity. Before
+   upstream, verify actual cross-instance event delivery and teardown, not only
+   successful allocation. Do not present the current patch as complete routing.
+
+7. Point sprites: Vulkan (88752c0), legacy D3D12 (2242c4e89ebb).
+   Restore selected texture-coordinate replacement and correct pixel size.
+   D3D12 quad expansion uses draw-relative SV_VertexID; the initial subtraction
+   of StartVertexLocation was wrong. WARP tests cover seven nonzero offsets,
+   including a deliberately broken negative control; 160 opening captures were
+   reviewed. Vulkan tests cover real glslang/SPIR-V translation where installed.
+   Split backend implementations. Indexed points/full-game behavior are not
+   established by the bounded opening regression.
+
+8. Current-depth sampling feedback (ea74b51b5751).
+   Stale depth snapshots generated false contours on the character and enemy.
+   Refresh the sampled current DSV, restore draw state, and use actual FP texture
+   dependencies to avoid unnecessary copies. WARP checks five generations and
+   320 packed pixels; game trace recorded one snapshot per frame across 3051
+   frames. Extract from legacy state handling and cover aliasing/state restoration.
+
+9. Exact-source DXBC cache and CPU preparation (ea5d2060823b).
+   Repeated HLSL compilation caused large transition stalls. Exact source,
+   compiler identity, entry/profile/flags and validated disk payloads govern
+   reuse. Null-SRV reuse and prepared float vertex fetch are separate changes;
+   split them from the shader cache for review. Tests include corrupt cache
+   fallback, descriptor invalidation and 1080 bit-exact float comparisons.
+
+10. Persisted driver PSO blobs (1ac8c318021b).
+    Complete descriptor/shader/root-signature/input-layout identities, driver
+    rejection fallback and bounded files reduce residual first-use stalls.
+    Local forest/save-point longest intervals changed from approximately
+    1316/529 ms (cold), to 162/126 ms (DXBC), to 72/68 ms (learned PSO cache).
+    These are same-route/stage windows, not identical animation frames.
+    Separate from DXBC caching; validate adapter/driver migration and failures.
+
+11. Fused linear guest readback row copy (01637cd).
+    Avoid an intermediate conversion/copy while retaining guest writes.
+    Tiling, FP16 and partial-pixel cases retain the old path. Small potential
+    optimization; submit only with independent layout/coherency regressions and
+    focused measurements. No large general speedup is established.
+
+Keep in the fork initially
+
+12. CPU preview readback (f81f71ad380d).
+    Explicit WIDTHxHEIGHT compatibility selection; Eternal Sonata uses 320x160.
+    Read back matching local linear A8R8G8B8 draws and 1:1 copy destinations,
+    restore resource state, convert RGBA to guest ARGB, preserve pitch and SPU
+    reservation bookkeeping. Actual overwritten PREVIEW0 survives process
+    restart and displays the scene instead of striped stale VRAM.
+    This is not general GPU/CPU coherence or mid-batch semaphore synchronization.
+    Existing corrupt previews need an in-game save. Ordinary forest frames
+    perform no matched readback. A general synchronization design would make
+    a stronger upstream proposal than a size-selected compatibility mechanism.
+
+13. Legacy backend restoration (acbcaf1586fe), preserved direct SPURS staging
+    (3c2bd0540d16), native lifted-SPU option (cd5c09331029), and embedded-Cg cache
+    preparation (7f47cb196f2e).
+    Useful for this delivery, but broad restoration can overwrite unrelated
+    upstream improvements; direct staging/native targeting need broader host
+    and workload evidence. The optional precompiler needs format/utility review.
+    None should be bundled into the small correctness PRs above.
+
+Current functional/performance boundary
+
+The final non-instrumented candidate was linked through an independent runtime
+archive in normal module order; original Release objects/EXE were not overwritten.
+EXE SHA256: 961c20d03b5fd69c69a2550e530a732f68c67841cb00174fa659a11fee59be10.
+Source tree equals the production tree at f81f71ad380d; later test-runner/document
+changes do not affect the game binary. No diagnostic input/capture hooks are in it.
+Only slot 1 exists in the isolated test profile. Save, overwrite, restart, preview
+read, full data read and continued movement were verified. Original saves remain
+unchanged. First-battle completion was previously observed once; it is not a
+claim of exhaustive combat stability.
+
+No-screenshot/no-build measurement windows count distinct guest flips with draws:
+- Fresh game at first save point: 16.72 FPS; restart from that save: 18.36 FPS.
+  Respawn slightly changes camera/position, so this is not a pixel-identical A/B.
+- Unmodified official EXE, same original save and no movement: 20.65 then 17.19 FPS.
+- Final ordered candidate, same load flow and start near flip 3185: 17.28 FPS.
+The original binary itself varies between runs. No sustained load-induced drop
+or added candidate slowdown was established, but the cause of the 17..21 FPS
+variation remains unresolved. Do not claim a restored fixed 20+ FPS or 30 FPS.
+Warm profile windows show no continuing PSO misses; first-use stalls and steady
+CPU/rendering cost remain separate questions.
+
+Recording and CI
+
+Fourteen adaptation commits accidentally used OpenAI Codex as author/committer.
+At the owner's request they were reconstructed as xuxinsss <397334202@qq.com>,
+retaining timestamps/messages and identical trees for every commit. An old-head
+bundle/ref and an old/new map are retained locally. Earlier owner-authored
+commits and upstream history were not changed.
+
+The existing four fork workflows are Windows (2 jobs), Linux (4), Linux Vulkan
+(2), and macOS (2). Branch pushes do not trigger them automatically: their push
+filters only match master/main, so workflow_dispatch is required for this branch.
+The new runner fixes make portable save/readback assertions run on POSIX as well,
+explicitly skip Windows GPU tests off Windows, build the optional precompiler
+when invoked without arguments, and retain point-sprite CPU tests when glslang
+is unavailable on Windows. POSIX SPIR-V cache tests remain on Linux/macOS.
+A workflow being dispatched, or a platform-specific SKIP, is not a passing result.
+Final CI results must be checked against the actual dispatched head SHA.
