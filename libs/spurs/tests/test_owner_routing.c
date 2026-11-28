@@ -287,8 +287,8 @@ int main(int argc, char **argv) {
   } else if (!strcmp(mode, "unknown-owner")) {
     attach(a, q1, 1, 0);
     expected_ack = CELL_ENOTCONN;
-    send(0, 1, 0, 0);
-    send(0, 1, 0, 1);
+    send(0x6000, 1, 0, 0);
+    send(0x6000, 1, 0, 1);
     receive(q1, 0, 0);
   } else if (!strcmp(mode, "full-queue")) {
     attach(a, q1, 1, 0);
@@ -304,6 +304,15 @@ int main(int argc, char **argv) {
     attach(a, q1, 1, 0);
     CHECK(spu_deliver_user_event(&c, 1u << 24) == 1);
     CHECK(spu_channel_read(&c.ch_in_mbox) == CELL_EINVAL);
+    receive(q1, 0, 0);
+  } else if (!strcmp(mode, "unowned-raw")) {
+    spu_context c;
+    memset(&c, 0, sizeof c);
+    attach(a, q1, 1, 0);
+    spu_channel_write(&c.ch_out_mbox, 0xbeef);
+    CHECK(spu_deliver_user_event(&c, 1u << 24) == 0);
+    CHECK(c.ch_in_mbox.count == 0 && c.ch_out_mbox.count == 1);
+    CHECK(spu_channel_read(&c.ch_out_mbox) == 0xbeef);
     receive(q1, 0, 0);
   } else if (!strcmp(mode, "concurrent"))
     concurrent_senders(a, b, q1, q2);

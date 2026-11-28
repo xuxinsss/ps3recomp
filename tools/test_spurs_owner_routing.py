@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-owner-routing-') as directory:
         subprocess.run(command, cwd=temp, env=env, check=True)
     cases = ['single', 'distinct-ports', 'same-static', 'same-dynamic', 'reverse-order', 'throw-collision',
              'duplicate-no-mutation', 'detach', 'finalize-helper', 'finalized-sender', 'reuse-with-detach',
-             'shared-queue-finalize', 'capacity', 'unknown-owner', 'full-queue', 'malformed-mailbox', 'concurrent']
+             'shared-queue-finalize', 'capacity', 'unknown-owner', 'full-queue', 'malformed-mailbox', 'concurrent', 'unowned-raw']
     for case in cases:
         subprocess.run([str(binary), case], cwd=temp, env=env, check=True, timeout=15)
     print('PASS: all', len(cases), 'SPURS routing cases')

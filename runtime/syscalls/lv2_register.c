@@ -1703,7 +1703,9 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
     /* No lv2 group: SPU code under SPURS. Only its user events route, through
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t owner, uint32_t port);
-    if (!spu->spu_group_id && code >= 128) return 0;
+    /* Raw/unowned SPUs use the ordinary interrupt-mailbox hook. Do not
+     * reinterpret their payloads as SPURS send_event requests. */
+    if (!spu->spu_group_id && (!spu->spurs_ea || code >= 128)) return 0;
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
      * 128 acknowledges the result; 192 is the impatient, no-ack form. */
     if (code == 128 || code == 192) {
