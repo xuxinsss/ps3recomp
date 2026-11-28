@@ -17,4 +17,22 @@ if sys.platform=='darwin':
     if p.returncode:print(p.stderr,flush=True)
     p.check_returncode()
   print('PASS: macOS background QoS and 250ms host delay, 4 real-thread executions',flush=True)
+# Check the shared #882 correction against its deliberately reversed ordering.
+with tempfile.TemporaryDirectory(prefix='pm-counter-proof-') as directory:
+ temp=Path(directory);bench=(root/'tests/bench_spurs_pm_hop.c').read_text()
+ start=bench.index('static void pm_run(');end=bench.index('static void pm_a(',start);original=bench[start:end]
+ store='        __atomic_store_n(&g_hops, h + 1, __ATOMIC_RELEASE);\n'
+ assert original.count(store)==1
+ reversed_order=original.replace(store,'').replace('    }\n    c->pc = SPURS_PM_EXIT_TO_KERNEL_LS;',store+'    }\n    c->pc = SPURS_PM_EXIT_TO_KERNEL_LS;')
+ assert reversed_order.count(store)==1
+ for name,source,wanted in [('fixed',original,0),('wake-before-count',reversed_order,1)]:
+  (temp/'spurs_hop_under_test.inc').write_text(source)
+  binary=temp/name
+  subprocess.run(['cc','-std=gnu17','-O1','-UNDEBUG','-I'+str(temp),str(root/'tests/test_spurs_hop_counter.c'),'-o',str(binary)],check=True)
+  result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=10)
+  print(name,result.stdout,result.stderr,flush=True)
+  assert result.returncode==wanted,(name,result.returncode)
+  if wanted:assert 'ran=2, counted=1' in result.stderr
+  else:assert 'PASS: overlapping benchmark hops retain both completions' in result.stdout
+ print('PASS: shared PM hop correction and reversed-order negative control',flush=True)
 print('PASS: candidate negative controls and delayed-host contracts '+expected,flush=True)
